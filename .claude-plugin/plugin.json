@@ -2,7 +2,7 @@
   "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "docker-claude",
   "displayName": "Docker Claude Toolkit",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Safely installs reusable Docker infrastructure skills and scripts into Claude Code projects.",
   "author": {
     "name": "DriverPlus"
