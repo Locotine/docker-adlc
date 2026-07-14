@@ -1,0 +1,20 @@
+{
+  "name": "driverplus-tools",
+  "owner": {
+    "name": "DriverPlus"
+  },
+  "description": "Reusable Claude Code tools maintained by DriverPlus.",
+  "plugins": [
+    {
+      "name": "docker-claude",
+      "source": "./",
+      "description": "Merge Docker infrastructure skills and scripts into an existing project without replacing its folders.",
+      "category": "development",
+      "tags": [
+        "docker",
+        "infrastructure",
+        "project-setup"
+      ]
+    }
+  ]
+}

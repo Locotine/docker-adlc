@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
+  "name": "docker-claude",
+  "displayName": "Docker Claude Toolkit",
+  "version": "1.0.0",
+  "description": "Safely installs reusable Docker infrastructure skills and scripts into Claude Code projects.",
+  "author": {
+    "name": "DriverPlus"
+  },
+  "homepage": "https://github.com/Locotine/docker-adlc#readme",
+  "repository": "https://github.com/Locotine/docker-adlc",
+  "keywords": [
+    "docker",
+    "infrastructure",
+    "claude-code",
+    "devtools"
+  ]
+}
