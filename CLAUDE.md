@@ -54,14 +54,14 @@ For an end-to-end local marketplace check, use a temporary Claude configuration 
 
 ```bash
 export CLAUDE_CONFIG_DIR="$(mktemp -d)"
-claude plugin marketplace add ./
-claude plugin install docker-claude@driverplus-tools
+claude plugin marketplace add ./ --scope user
+claude plugin install docker-claude@driverplus-tools --scope user
 claude plugin details docker-claude@driverplus-tools
 ```
 
 ## Release rules
 
 - Bump `version` in `.claude-plugin/plugin.json` for every published update; pinned plugin versions are not refreshed until this value changes.
-- Keep `README.md` installation commands aligned with the marketplace and plugin names.
+- Keep `README.md` installation commands aligned with the marketplace and plugin names, and always pass `--scope user` explicitly. Do not document a global/system-wide install.
 - Run the full verification block before pushing.
 - Review installer changes specifically for unintended overwrites or path traversal.

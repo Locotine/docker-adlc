@@ -20,23 +20,21 @@ Installer xử lý từng file:
 
 ## Cài từ GitHub
 
-Thêm marketplace trực tiếp từ repository GitHub:
+Plugin được đăng ký ở **user scope** của Claude Code, chỉ dành cho user hiện tại trên máy. Không dùng cài đặt system-wide/global. Chạy trong terminal:
+
+```bash
+claude plugin marketplace add Locotine/docker-adlc --scope user
+claude plugin install docker-claude@driverplus-tools --scope user
+```
+
+`user` là scope chính thức của Claude Code; CLI không có scope `global`. Sau đó mở Claude Code tại project đích và chạy:
 
 ```text
-/plugin marketplace add Locotine/docker-adlc
-/plugin install docker-claude@driverplus-tools
 /docker-claude:install-project
 /reload-plugins
 ```
 
-Có thể cài marketplace và plugin bằng CLI:
-
-```bash
-claude plugin marketplace add Locotine/docker-adlc
-claude plugin install docker-claude@driverplus-tools
-```
-
-Sau đó mở Claude Code tại project đích và chạy `/docker-claude:install-project`.
+Plugin có thể được gọi bởi user hiện tại trong nhiều project, nhưng payload `.claude/skills` và `scripts` chỉ được merge vào project khi bạn chủ động chạy `install-project` tại project đó.
 
 ## Preview trước khi merge
 
@@ -63,8 +61,8 @@ Test toàn bộ flow marketplace bằng một thư mục cấu hình Claude tạ
 
 ```bash
 export CLAUDE_CONFIG_DIR="$(mktemp -d)"
-claude plugin marketplace add ./
-claude plugin install docker-claude@driverplus-tools
+claude plugin marketplace add ./ --scope user
+claude plugin install docker-claude@driverplus-tools --scope user
 claude plugin list
 ```
 
