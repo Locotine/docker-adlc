@@ -50,6 +50,10 @@ class InstallProjectTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(custom_skill.read_text(), "custom skill\n")
             self.assertEqual(custom_script.read_text(), "custom script\n")
+            self.assertTrue(
+                (target / ".claude" / "skills" / "docker-bootstrap" / "SKILL.md").is_file()
+            )
+            self.assertFalse((target / ".claude" / "skills" / "bootstrap").exists())
             self.assertTrue((target / ".claude" / "skills" / "infra-up" / "SKILL.md").is_file())
             installed_script = target / "scripts" / "infra-up.sh"
             self.assertTrue(installed_script.is_file())
@@ -70,6 +74,21 @@ class InstallProjectTests(unittest.TestCase):
             self.assertEqual(conflict.read_text(), "project-owned content\n")
             self.assertIn("conflict", result.stdout)
             self.assertIn("1 conflicts kept", result.stdout)
+
+    def test_legacy_bootstrap_skill_is_preserved_while_new_name_is_added(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            target = Path(temp)
+            legacy_skill = target / ".claude" / "skills" / "bootstrap" / "SKILL.md"
+            legacy_skill.parent.mkdir(parents=True)
+            legacy_skill.write_text("legacy project-owned skill\n")
+
+            result = self.run_installer(target)
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(legacy_skill.read_text(), "legacy project-owned skill\n")
+            self.assertTrue(
+                (target / ".claude" / "skills" / "docker-bootstrap" / "SKILL.md").is_file()
+            )
 
     def test_second_run_reports_unchanged(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

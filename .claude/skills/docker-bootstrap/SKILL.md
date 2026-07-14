@@ -1,9 +1,9 @@
 ---
-name: bootstrap
+name: docker-bootstrap
 description: One-shot end-to-end setup + start for the project. Chains infra-init (if `infra/` missing) → env check → infra-up → sync-env-docker verify (per app) → print host URLs. Use when the user says "bootstrap", "chạy toàn bộ dự án", "up hết", "onboarding project mới", "one-shot start", "one-click up", "khởi động cả stack", "clone xong rồi làm gì", or is a new developer picking up the repo for the first time. NEVER tears anything down — use [[infra-down]] for that.
 ---
 
-# bootstrap
+# docker-bootstrap
 
 Chains all the "up" skills into a single command so a new dev (or the same dev after a reboot) can go from clean checkout to running stack in one step.
 
@@ -27,7 +27,7 @@ Flags:
 - `--recreate` — forwarded to infra-up; force recreate containers
 - `--skip-init` — do NOT scaffold even if `infra/` missing (fail loudly instead)
 - `--skip-verify` — skip the per-service env verify step
-- `--yes` / `-y` — assume yes to bootstrap's own prompts (init trigger, env copy). Does NOT affect the inner interactive infra-init prompts.
+- `--yes` / `-y` — assume yes to docker-bootstrap's own prompts (init trigger, env copy). Does NOT affect the inner interactive infra-init prompts.
 
 ## Flow (5 steps)
 
@@ -39,9 +39,9 @@ Flags:
 
 ## Behaviour rules
 
-1. **Never destructive** — bootstrap only creates and starts. Data volumes untouched. For teardown use [[infra-down]].
+1. **Never destructive** — docker-bootstrap only creates and starts. Data volumes untouched. For teardown use [[infra-down]].
 2. **Idempotent** — safe to re-run: init step skips if already exists, up step is a no-op if containers already healthy.
-3. **Halts on hard errors** — if `infra-init` or `infra-up` fails, bootstrap exits with their status. Verify problems are reported but not fatal.
+3. **Halts on hard errors** — if `infra-init` or `infra-up` fails, docker-bootstrap exits with their status. Verify problems are reported but not fatal.
 4. **Interactive by default** — will prompt at init + env-copy junctions. Use `--yes` to auto-accept both.
 
 ## Typical output shape
@@ -76,5 +76,5 @@ done.
 - [[infra-init]] — step 1
 - [[infra-up]] — step 3
 - [[sync-env-docker]] — step 4
-- [[docker-apps-up]] — for single-service restarts after bootstrap
+- [[docker-apps-up]] — for single-service restarts after docker-bootstrap
 - [[infra-down]] — teardown (deliberately NOT chained here)

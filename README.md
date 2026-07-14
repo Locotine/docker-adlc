@@ -20,21 +20,36 @@ Installer xử lý từng file:
 
 ## Cài từ GitHub
 
-Plugin được đăng ký ở **user scope** của Claude Code, chỉ dành cho user hiện tại trên máy. Không dùng cài đặt system-wide/global. Chạy trong terminal:
+Claude Code hỗ trợ ba scope khi cài plugin:
+
+| Scope | Phạm vi |
+| --- | --- |
+| `user` | Dùng cho user hiện tại trong mọi project; đây là mặc định và là lựa chọn gần nhất với "global". |
+| `project` | Dùng chung cho repository qua `.claude/settings.json`. |
+| `local` | Chỉ dùng cho user hiện tại trong repository này qua `.claude/settings.local.json`. |
+
+CLI không có scope `global` hoặc system-wide cho tất cả user trên máy. Để chọn scope ngay lúc cài, chạy đoạn sau trong terminal:
 
 ```bash
-claude plugin marketplace add Locotine/docker-adlc --scope user
-claude plugin install docker-claude@driverplus-tools --scope user
+read -r -p "Scope [user/project/local] (user): " SCOPE
+SCOPE="${SCOPE:-user}"
+case "$SCOPE" in
+  user|project|local) ;;
+  *) echo "Scope không hợp lệ: $SCOPE" >&2; exit 2 ;;
+esac
+
+claude plugin marketplace add Locotine/docker-adlc --scope "$SCOPE"
+claude plugin install docker-claude@driverplus-tools --scope "$SCOPE"
 ```
 
-`user` là scope chính thức của Claude Code; CLI không có scope `global`. Sau đó mở Claude Code tại project đích và chạy:
+Hoặc thêm marketplace, mở `/plugin`, vào tab **Discover**, chọn `docker-claude`, rồi chọn `User`, `Project` hoặc `Local` trong giao diện cài đặt. Sau đó mở Claude Code tại project đích và chạy:
 
 ```text
 /docker-claude:install-project
 /reload-plugins
 ```
 
-Plugin có thể được gọi bởi user hiện tại trong nhiều project, nhưng payload `.claude/skills` và `scripts` chỉ được merge vào project khi bạn chủ động chạy `install-project` tại project đó.
+Với `user` scope, plugin có thể được gọi bởi user hiện tại trong nhiều project. Dù chọn scope nào, payload `.claude/skills` và `scripts` chỉ được merge vào project khi bạn chủ động chạy `install-project` tại project đó.
 
 ## Preview trước khi merge
 
@@ -86,6 +101,8 @@ claude --plugin-dir .
 ```
 
 Việc chạy lại installer chỉ thêm file mới. File project đã tồn tại không bị update âm thầm; conflict sẽ được liệt kê để xử lý thủ công.
+
+Từ phiên bản `1.0.1`, skill `bootstrap` được đổi tên thành `docker-bootstrap`. Với project đã cài bản cũ, chạy lại `/docker-claude:install-project` để thêm skill mới. Installer giữ nguyên `.claude/skills/bootstrap` cũ theo nguyên tắc không tự xóa file project; có thể xóa skill cũ thủ công sau khi xác nhận project đã nhận `.claude/skills/docker-bootstrap`.
 
 ## Cấu trúc
 

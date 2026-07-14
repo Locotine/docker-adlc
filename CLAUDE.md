@@ -18,7 +18,7 @@ Never publish or copy `.claude/settings.local.json`; it is machine-local and ign
 
 Use the repository's actual skills and scripts for these requests:
 
-- Project onboarding, one-shot setup, or “run everything” → use `bootstrap` and `scripts/bootstrap.sh`.
+- Project onboarding, one-shot setup, or “run everything” → use `docker-bootstrap` and `scripts/bootstrap.sh`.
 - Scaffold a new shared Docker stack → use `infra-init` and `scripts/infra-init.py`.
 - Start the complete Docker stack or infrastructure only → use `infra-up` and `scripts/infra-up.sh`.
 - Start or rebuild selected application services without restarting infrastructure → use `docker-apps-up` and `scripts/docker-apps-up.sh`.
@@ -62,6 +62,6 @@ claude plugin details docker-claude@driverplus-tools
 ## Release rules
 
 - Bump `version` in `.claude-plugin/plugin.json` for every published update; pinned plugin versions are not refreshed until this value changes.
-- Keep `README.md` installation commands aligned with the marketplace and plugin names, and always pass `--scope user` explicitly. Do not document a global/system-wide install.
+- Keep `README.md` installation commands aligned with the marketplace and plugin names. Only pass Claude Code's supported scopes (`user`, `project`, or `local`); recommend `user` by default and never claim that a global/system-wide scope exists.
 - Run the full verification block before pushing.
 - Review installer changes specifically for unintended overwrites or path traversal.
