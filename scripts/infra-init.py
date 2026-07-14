@@ -287,8 +287,8 @@ INFRA_SERVICE_YAML = {
     restart: unless-stopped
     environment:
       POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
-      POSTGRES_DB: postgres
+      POSTGRES_PASSWORD: '${{POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in infra/.env}}'
+{postgres_service_env}{postgres_module_env}      POSTGRES_DB: postgres
     ports: ['5432:5432']
     volumes:
       - pg-data:/var/lib/postgresql/data
@@ -351,11 +351,11 @@ INFRA_SERVICE_YAML = {
     command: [start-dev, --http-port=8080, --hostname-strict=false, --import-realm]
     environment:
       KEYCLOAK_ADMIN: admin
-      KEYCLOAK_ADMIN_PASSWORD: admin
+      KEYCLOAK_ADMIN_PASSWORD: '${{KEYCLOAK_ADMIN_PASSWORD:?set KEYCLOAK_ADMIN_PASSWORD in infra/.env}}'
       KC_DB: postgres
       KC_DB_URL: jdbc:postgresql://postgres:5432/keycloak
       KC_DB_USERNAME: keycloak
-      KC_DB_PASSWORD: keycloak
+      KC_DB_PASSWORD: '${{KEYCLOAK_DB_PASSWORD:?set KEYCLOAK_DB_PASSWORD in infra/.env}}'
       KC_HEALTH_ENABLED: 'true'
       KC_HTTP_ENABLED: 'true'
       KC_HOSTNAME_STRICT: 'false'
@@ -380,7 +380,7 @@ INFRA_SERVICE_YAML = {
       DB: postgres12
       DB_PORT: '5432'
       POSTGRES_USER: temporal
-      POSTGRES_PWD: temporal
+      POSTGRES_PWD: '${{TEMPORAL_DB_PASSWORD:?set TEMPORAL_DB_PASSWORD in infra/.env}}'
       POSTGRES_SEEDS: postgres
       DBNAME: temporal
       VISIBILITY_DBNAME: temporal_visibility
@@ -413,8 +413,8 @@ INFRA_SERVICE_YAML = {
     restart: unless-stopped
     command: [server, /data, --console-address, ':9001']
     environment:
-      MINIO_ROOT_USER: minioadmin
-      MINIO_ROOT_PASSWORD: minioadmin
+      MINIO_ROOT_USER: '${{MINIO_ROOT_USER:?set MINIO_ROOT_USER in infra/.env}}'
+      MINIO_ROOT_PASSWORD: '${{MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD in infra/.env}}'
     ports: ['9000:9000', '9001:9001']
     volumes: [minio-data:/data]
     healthcheck:
@@ -498,9 +498,31 @@ volumes:
         vols.extend(MODULE_VOLUMES.get(m, []))
     header += "".join(f"  {v}:\n" for v in vols) or "  {}\n"
     header += "\nservices:\n"
+    postgres_service_env = "".join(
+        f"      {_service_db_password_key(s.name)}: "
+        f"'${{{_service_db_password_key(s.name)}:?set {_service_db_password_key(s.name)} in infra/.env}}'\n"
+        for s in plan.services
+        if "postgres" in s.detected_infra
+    )
+    postgres_module_env = ""
+    if "keycloak" in plan.infra_modules:
+        postgres_module_env += (
+            "      KEYCLOAK_DB_PASSWORD: "
+            "'${KEYCLOAK_DB_PASSWORD:?set KEYCLOAK_DB_PASSWORD in infra/.env}'\n"
+        )
+    if "temporal" in plan.infra_modules:
+        postgres_module_env += (
+            "      TEMPORAL_DB_PASSWORD: "
+            "'${TEMPORAL_DB_PASSWORD:?set TEMPORAL_DB_PASSWORD in infra/.env}'\n"
+        )
     body = ""
     for m in plan.infra_modules:
-        body += INFRA_SERVICE_YAML[m].format(proj=plan.project_name, net=plan.network_name)
+        body += INFRA_SERVICE_YAML[m].format(
+            proj=plan.project_name,
+            net=plan.network_name,
+            postgres_service_env=postgres_service_env,
+            postgres_module_env=postgres_module_env,
+        )
     return header + body
 
 
@@ -549,7 +571,14 @@ def _yaml_quote(v: str) -> str:
 def _env_for_service(s: ServiceCandidate, plan: InitPlan) -> List[Tuple[str, str]]:
     env: List[Tuple[str, str]] = []
     if "postgres" in s.detected_infra and "postgres" in plan.infra_modules:
-        env.append(("DATABASE_URL", f"postgresql://{s.name}:{s.name}@postgres:5432/{s.name}"))
+        password_key = _service_db_password_key(s.name)
+        password_ref = f"${{{password_key}:?set {password_key} in infra/.env}}"
+        database_url = (
+            f"postgresql://{s.name}:"
+            f"{password_ref}"
+            f"@postgres:5432/{s.name}"
+        )
+        env.append(("DATABASE_URL", database_url))
     if "redis" in s.detected_infra and "redis" in plan.infra_modules:
         env.append(("REDIS_URL", "redis://redis:6379"))
     if "kafka" in s.detected_infra and "kafka" in plan.infra_modules:
@@ -561,8 +590,8 @@ def _env_for_service(s: ServiceCandidate, plan: InitPlan) -> List[Tuple[str, str
         env.append(("TEMPORAL_ADDRESS", "temporal:7233"))
     if "minio" in s.detected_infra and "minio" in plan.infra_modules:
         env.append(("S3_ENDPOINT", "http://minio:9000"))
-        env.append(("S3_ACCESS_KEY_ID", "minioadmin"))
-        env.append(("S3_SECRET_ACCESS_KEY", "minioadmin"))
+        env.append(("S3_ACCESS_KEY_ID", "${MINIO_ROOT_USER:?set MINIO_ROOT_USER in infra/.env}"))
+        env.append(("S3_SECRET_ACCESS_KEY", "${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD in infra/.env}"))
     if "elasticsearch" in s.detected_infra and "elasticsearch" in plan.infra_modules:
         env.append(("ELASTICSEARCH_URL", "http://elasticsearch:9200"))
     return env
@@ -585,11 +614,25 @@ def render_env_example(plan: InitPlan) -> str:
         "# Các biến ${VAR:?...} trong docker-compose.apps.yml sẽ đọc từ file này.",
         "",
     ]
+    if "postgres" in plan.infra_modules:
+        lines += [
+            "POSTGRES_PASSWORD=REPLACE_ME_POSTGRES_PASSWORD",
+            *(
+                f"{_service_db_password_key(s.name)}=REPLACE_ME_{_service_db_password_key(s.name)}"
+                for s in plan.services
+                if "postgres" in s.detected_infra
+            ),
+            "",
+        ]
     if "keycloak" in plan.infra_modules:
         lines += [
+            "KEYCLOAK_ADMIN_PASSWORD=REPLACE_ME_KEYCLOAK_ADMIN_PASSWORD",
+            "KEYCLOAK_DB_PASSWORD=REPLACE_ME_KEYCLOAK_DB_PASSWORD",
+            "",
             "# Mint client secret sau khi Keycloak up (thay dp-p2 = realm của bạn):",
+            "#   set -a; . ./.env; set +a",
             "#   TOKEN=$(curl -s -X POST http://localhost:8080/realms/master/protocol/openid-connect/token \\",
-            "#     -d client_id=admin-cli -d username=admin -d password=admin -d grant_type=password \\",
+            "#     -d client_id=admin-cli -d username=admin -d password=\"$KEYCLOAK_ADMIN_PASSWORD\" -d grant_type=password \\",
             "#     | python3 -c 'import json,sys;print(json.load(sys.stdin)[\"access_token\"])')",
             "#   CID=$(curl -s -H \"Authorization: Bearer $TOKEN\" \\",
             "#     'http://localhost:8080/admin/realms/<REALM>/clients?clientId=<CLIENT>' \\",
@@ -600,26 +643,51 @@ def render_env_example(plan: InitPlan) -> str:
             "# EXAMPLE_ADMIN_SECRET=REPLACE_ME",
             "",
         ]
+    if "temporal" in plan.infra_modules:
+        lines += ["TEMPORAL_DB_PASSWORD=REPLACE_ME_TEMPORAL_DB_PASSWORD", ""]
+    if "minio" in plan.infra_modules:
+        lines += [
+            "MINIO_ROOT_USER=REPLACE_ME_MINIO_ROOT_USER",
+            "MINIO_ROOT_PASSWORD=REPLACE_ME_MINIO_ROOT_PASSWORD",
+            "",
+        ]
     return "\n".join(lines)
 
 
+def _service_db_password_key(service_name: str) -> str:
+    normalized = re.sub(r"[^A-Za-z0-9]+", "_", service_name).strip("_").upper()
+    return f"{normalized}_DB_PASSWORD"
+
+
+def _sql_identifier(value: str) -> str:
+    return '"' + value.replace('"', '""') + '"'
+
+
 def render_pg_init(plan: InitPlan) -> str:
-    dbs = [s.name for s in plan.services if "postgres" in s.detected_infra]
+    dbs = [(s.name, _service_db_password_key(s.name))
+           for s in plan.services if "postgres" in s.detected_infra]
     body = "#!/bin/bash\n# Auto-generated. Creates one DB + role per service.\nset -e\n\n"
-    for db in dbs:
-        body += f'psql -v ON_ERROR_STOP=1 --username postgres <<-EOSQL\n'
-        body += f'    CREATE USER {db} WITH PASSWORD \'{db}\';\n'
-        body += f'    CREATE DATABASE {db} OWNER {db};\n'
-        body += f'    GRANT ALL ON DATABASE {db} TO {db};\n'
+    for db, password_key in dbs:
+        identifier = _sql_identifier(db)
+        body += f': "${{{password_key}:?set {password_key}}}"\n'
+        body += (f'psql -v ON_ERROR_STOP=1 --username postgres '
+                 f'--set=role_password="${{{password_key}}}" <<-EOSQL\n')
+        body += f'    CREATE USER {identifier} WITH PASSWORD :\'role_password\';\n'
+        body += f'    CREATE DATABASE {identifier} OWNER {identifier};\n'
+        body += f'    GRANT ALL ON DATABASE {identifier} TO {identifier};\n'
         body += "EOSQL\n\n"
     # Extra DBs for keycloak/temporal
     if "keycloak" in plan.infra_modules:
-        body += 'psql -v ON_ERROR_STOP=1 --username postgres <<-EOSQL\n'
-        body += "    CREATE USER keycloak WITH PASSWORD 'keycloak';\n"
+        body += ': "${KEYCLOAK_DB_PASSWORD:?set KEYCLOAK_DB_PASSWORD}"\n'
+        body += ('psql -v ON_ERROR_STOP=1 --username postgres '
+                 '--set=role_password="$KEYCLOAK_DB_PASSWORD" <<-EOSQL\n')
+        body += "    CREATE USER keycloak WITH PASSWORD :'role_password';\n"
         body += "    CREATE DATABASE keycloak OWNER keycloak;\nEOSQL\n\n"
     if "temporal" in plan.infra_modules:
-        body += 'psql -v ON_ERROR_STOP=1 --username postgres <<-EOSQL\n'
-        body += "    CREATE USER temporal WITH PASSWORD 'temporal';\n"
+        body += ': "${TEMPORAL_DB_PASSWORD:?set TEMPORAL_DB_PASSWORD}"\n'
+        body += ('psql -v ON_ERROR_STOP=1 --username postgres '
+                 '--set=role_password="$TEMPORAL_DB_PASSWORD" <<-EOSQL\n')
+        body += "    CREATE USER temporal WITH PASSWORD :'role_password';\n"
         body += "    CREATE DATABASE temporal OWNER temporal;\n"
         body += "    CREATE DATABASE temporal_visibility OWNER temporal;\nEOSQL\n"
     return body
