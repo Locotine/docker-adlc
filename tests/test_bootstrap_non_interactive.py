@@ -1,20 +1,354 @@
 from __future__ import annotations
 
+import contextlib
+import importlib.util
+import io
 import json
 import os
 import shutil
+import socket
 import stat
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from typing import Dict
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parent.parent
 
 
+def load_infra_init_module():
+    path = ROOT / "scripts" / "infra-init.py"
+    spec = importlib.util.spec_from_file_location("docker_claude_infra_init_bootstrap", path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load infra init module from {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+INFRA_INIT_MODULE = load_infra_init_module()
+
+
 class BootstrapNonInteractiveTests(unittest.TestCase):
+    def test_compose_name_normalization_preserves_valid_separators(self) -> None:
+        self.assertEqual(INFRA_INIT_MODULE._normalize_compose_name("foo__bar"), "foo__bar")
+        self.assertEqual(INFRA_INIT_MODULE._normalize_compose_name("foo--bar"), "foo--bar")
+
+    def test_port_probe_detects_an_active_host_listener(self) -> None:
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.addCleanup(listener.close)
+        listener.bind(("0.0.0.0", 0))
+        listener.listen(1)
+
+        self.assertFalse(INFRA_INIT_MODULE._port_is_available(listener.getsockname()[1]))
+
+    def test_detection_allocates_available_ports_across_apps_and_infra(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            self._write_node_service(
+                project / "api",
+                dependencies={"pg": "latest", "redis": "latest"},
+                port=4100,
+            )
+
+            busy = {4100, 5432, 6379}
+            with mock.patch.object(
+                INFRA_INIT_MODULE,
+                "_port_is_available",
+                side_effect=lambda port: port not in busy,
+            ):
+                report = INFRA_INIT_MODULE.detection_report(project)
+
+            config = report["suggested_config"]
+            self.assertEqual(config["services"]["api"]["host_port"], 4101)
+            self.assertEqual(config["infra_ports"]["postgres"]["postgres"], 5433)
+            self.assertEqual(config["infra_ports"]["redis"]["redis"], 6380)
+            unavailable = [
+                item for item in report["uncertainties"]
+                if item["type"] == "host_port_unavailable"
+            ]
+            self.assertEqual(
+                {(item["scope"], item["name"], item["requested_port"]) for item in unavailable},
+                {
+                    ("service", "api", 4100),
+                    ("infra", "postgres.postgres", 5432),
+                    ("infra", "redis.redis", 6379),
+                },
+            )
+            with contextlib.redirect_stdout(io.StringIO()):
+                plan = INFRA_INIT_MODULE.build_plan(project, False, config=config)
+            infra_yaml = INFRA_INIT_MODULE.render_infra_yaml(plan)
+            apps_yaml = INFRA_INIT_MODULE.render_apps_yaml(plan)
+            self.assertIn("'5433:5432'", infra_yaml)
+            self.assertIn("'6380:6379'", infra_yaml)
+            self.assertIn("'4101:4100'", apps_yaml)
+
+    def test_generation_normalizes_images_and_requires_dockerfile_review(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp) / "DriverPlus @ Boundaries"
+            project.mkdir()
+            existing = project / "D-IDENTITY-TRUST"
+            missing = project / "D-TAXONOMY"
+            self._write_node_service(existing, dependencies={"pg": "latest"}, port=4200)
+            self._write_node_service(missing, dependencies={"redis": "latest"}, port=4201)
+            (existing / "Dockerfile").write_text(
+                "FROM node:20-alpine\nRUN groupadd -r app --gid=1000\n"
+            )
+
+            report = INFRA_INIT_MODULE.detection_report(project)
+            config = report["suggested_config"]
+            self.assertEqual(config["project_name"], "driverplus-boundaries")
+            self.assertEqual(
+                config["services"]["D-IDENTITY-TRUST"]["dockerfile"],
+                "service",
+            )
+            self.assertEqual(config["services"]["D-TAXONOMY"]["dockerfile"], "generated")
+            dockerfile_uncertainties = {
+                (item["type"], item.get("service")) for item in report["uncertainties"]
+            }
+            self.assertIn(
+                ("dockerfile_fixed_identity", "D-IDENTITY-TRUST"),
+                dockerfile_uncertainties,
+            )
+            self.assertIn(("missing_dockerfile", "D-TAXONOMY"), dockerfile_uncertainties)
+
+            # Simulate the reviewed choice to avoid the risky service Dockerfile.
+            config["services"]["D-IDENTITY-TRUST"]["dockerfile"] = "generated"
+            plan_path = project / "reviewed-plan.json"
+            plan_path.write_text(json.dumps(config))
+            result = subprocess.run(
+                [
+                    str(ROOT / "scripts" / "infra-init.py"),
+                    "--root",
+                    str(project),
+                    "--config",
+                    str(plan_path),
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout)
+            apps_yaml = (project / "infra" / "docker-compose.apps.yml").read_text()
+            image_lines = [line.strip() for line in apps_yaml.splitlines() if "image:" in line]
+            self.assertEqual(
+                image_lines,
+                [
+                    "image: driverplus-boundaries/d-identity-trust:local",
+                    "image: driverplus-boundaries/d-taxonomy:local",
+                ],
+            )
+            self.assertNotIn("container_name:", apps_yaml)
+            self.assertIn(
+                "dockerfile: ../infra/dockerfiles/Dockerfile.D-IDENTITY-TRUST",
+                apps_yaml,
+            )
+            for service_name in ("D-IDENTITY-TRUST", "D-TAXONOMY"):
+                generated = (
+                    project / "infra" / "dockerfiles" / f"Dockerfile.{service_name}"
+                ).read_text()
+                self.assertIn("USER node", generated)
+                self.assertNotIn("groupadd", generated)
+
+    def test_dockerfile_identity_detection_handles_multiline_and_arg_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            dockerfile = Path(tmp) / "Dockerfile"
+            risky_variants = (
+                "FROM node:20-alpine\nRUN groupadd -r app \\\n    --gid 1234\n",
+                "FROM node:20-alpine\nARG APP_GID=2345\nRUN addgroup -g $APP_GID app\n",
+                "FROM node:20-alpine\nARG UID=3456\nRUN useradd -u ${UID} app\n",
+                "FROM node:20-alpine\nARG USER_ID=4567\nRUN adduser -u $USER_ID app\n",
+            )
+            for content in risky_variants:
+                with self.subTest(content=content):
+                    dockerfile.write_text(content)
+                    self.assertTrue(
+                        INFRA_INIT_MODULE._dockerfile_has_fixed_identity(dockerfile)
+                    )
+
+            dockerfile.write_text("FROM node:20-alpine\nUSER node\n")
+            self.assertFalse(INFRA_INIT_MODULE._dockerfile_has_fixed_identity(dockerfile))
+
+    def test_invalid_service_names_and_normalized_image_collisions_are_blocked(self) -> None:
+        cases = (
+            ("invalid name", ("bad service",), "invalid_service_name"),
+            ("image collision", ("API", "api"), "image_name_collision"),
+        )
+        for label, service_names, uncertainty_type in cases:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as tmp:
+                project = Path(tmp)
+                for index, service_name in enumerate(service_names):
+                    self._write_node_service(
+                        project / service_name,
+                        dependencies={"redis": "latest"},
+                        port=4300 + index,
+                    )
+
+                report = INFRA_INIT_MODULE.detection_report(project)
+                self.assertIn(
+                    uncertainty_type,
+                    {item["type"] for item in report["uncertainties"]},
+                )
+                if uncertainty_type == "invalid_service_name":
+                    self.assertFalse(
+                        report["suggested_config"]["services"][service_names[0]]["include"]
+                    )
+
+                result = subprocess.run(
+                    [str(ROOT / "scripts" / "infra-init.py"), "--root", str(project), "--yes"],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    timeout=15,
+                    check=False,
+                )
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn("error:", result.stdout)
+                self.assertFalse((project / "infra").exists())
+
+    def test_app_infra_service_name_conflicts_are_reviewed_and_blocked(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            self._write_node_service(
+                project / "redis",
+                dependencies={"redis": "latest"},
+                port=4400,
+            )
+
+            report = INFRA_INIT_MODULE.detection_report(project)
+            conflicts = [
+                item
+                for item in report["uncertainties"]
+                if item["type"] == "service_name_conflict"
+            ]
+            self.assertEqual(conflicts[0]["service"], "redis")
+            self.assertEqual(conflicts[0]["infra_modules"], ["redis"])
+
+            result = subprocess.run(
+                [str(ROOT / "scripts" / "infra-init.py"), "--root", str(project), "--yes"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 2, result.stdout)
+            self.assertIn("conflict with enabled infra services", result.stdout)
+            self.assertFalse((project / "infra").exists())
+
+    def test_postgres_secret_key_collisions_are_reviewed_and_blocked(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            for index, service_name in enumerate(("api-a", "api_a")):
+                self._write_node_service(
+                    project / service_name,
+                    dependencies={"pg": "latest"},
+                    port=4500 + index,
+                )
+
+            report = INFRA_INIT_MODULE.detection_report(project)
+            conflicts = [
+                item
+                for item in report["uncertainties"]
+                if item["type"] == "secret_key_collision"
+            ]
+            self.assertEqual(conflicts[0]["secret_key"], "API_A_DB_PASSWORD")
+            self.assertEqual(conflicts[0]["services"], ["api-a", "api_a"])
+
+            result = subprocess.run(
+                [str(ROOT / "scripts" / "infra-init.py"), "--root", str(project), "--yes"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 2, result.stdout)
+            self.assertIn("duplicate environment secret keys", result.stdout)
+            self.assertFalse((project / "infra").exists())
+
+            # A reviewed plan may resolve the collision by disabling local Postgres.
+            config = report["suggested_config"]
+            config["infra_modules"] = []
+            config["infra_ports"] = {}
+            plan_path = project / "reviewed-plan.json"
+            plan_path.write_text(json.dumps(config))
+            resolved = subprocess.run(
+                [
+                    str(ROOT / "scripts" / "infra-init.py"),
+                    "--root",
+                    str(project),
+                    "--config",
+                    str(plan_path),
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+            self.assertEqual(resolved.returncode, 0, resolved.stdout)
+            apps_yaml = (project / "infra" / "docker-compose.apps.yml").read_text()
+            self.assertNotIn("DATABASE_URL", apps_yaml)
+
+    def test_reviewed_config_rejects_a_port_that_became_busy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.addCleanup(listener.close)
+            listener.bind(("0.0.0.0", 0))
+            listener.listen(1)
+            busy_port = listener.getsockname()[1]
+            self._write_node_service(project / "api", dependencies={}, port=busy_port)
+            config = {
+                "project_name": "reviewed",
+                "network_name": "reviewed",
+                "services": {
+                    "api": {
+                        "include": True,
+                        "host_port": busy_port,
+                        "container_port": busy_port,
+                        "dockerfile": "generated",
+                    }
+                },
+                "infra_modules": [],
+                "infra_ports": {},
+            }
+            plan_path = project / "plan.json"
+            plan_path.write_text(json.dumps(config))
+
+            result = subprocess.run(
+                [
+                    str(ROOT / "scripts" / "infra-init.py"),
+                    "--root",
+                    str(project),
+                    "--config",
+                    str(plan_path),
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 2, result.stdout)
+            self.assertIn("currently in use", result.stdout)
+            self.assertFalse((project / "infra").exists())
+
     def test_yes_bootstraps_fresh_project_without_stdin(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project = Path(tmp) / "Fresh Project"
@@ -271,6 +605,8 @@ class BootstrapNonInteractiveTests(unittest.TestCase):
                     **base_config,
                     "services": {**base_config["services"], "ghost": {"include": True}},
                 },
+                "invalid project name": {**base_config, "project_name": "Reviewed Project"},
+                "invalid network name": {**base_config, "network_name": "reviewed network"},
                 "boolean include": {
                     **base_config,
                     "services": {
@@ -294,6 +630,29 @@ class BootstrapNonInteractiveTests(unittest.TestCase):
                 },
                 "unknown module": {**base_config, "infra_modules": ["redis", "oracle"]},
                 "missing postgres": {**base_config, "infra_modules": ["temporal"]},
+                "duplicate app and infra port": {
+                    **base_config,
+                    "infra_ports": {"postgres": {"postgres": 5000}},
+                },
+                "unknown infra endpoint": {
+                    **base_config,
+                    "infra_ports": {"postgres": {"sql": 5432}},
+                },
+                "infra module ports not object": {
+                    **base_config,
+                    "infra_ports": {"postgres": 5432},
+                },
+                "infra endpoint port not integer": {
+                    **base_config,
+                    "infra_ports": {"postgres": {"postgres": "standard"}},
+                },
+                "invalid dockerfile strategy": {
+                    **base_config,
+                    "services": {
+                        **base_config["services"],
+                        "api-a": {**base_config["services"]["api-a"], "dockerfile": "guess"},
+                    },
+                },
             }
 
             for label, config in invalid_cases.items():

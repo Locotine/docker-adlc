@@ -86,9 +86,9 @@ Hoặc chạy trực tiếp trong terminal:
 
 `docker-bootstrap` sẽ lần lượt khởi tạo `infra/` nếu chưa có, kiểm tra `infra/.env`, bật infrastructure và application services, verify environment rồi in các URL localhost. Lệnh không tự xóa container, image hoặc volume.
 
-Ở chế độ `--yes`, các giá trị `REPLACE_ME_*` trong `.env.example` được thay bằng secret local ngẫu nhiên trước khi Docker khởi động; giá trị secret không được in ra output. Nếu project có Python/Go service chưa có Dockerfile, preflight sẽ yêu cầu quyết định thêm Dockerfile hoặc loại service khỏi plan thay vì tạo compose không build được.
+Ở chế độ `--yes`, các giá trị `REPLACE_ME_*` trong `.env.example` được thay bằng secret local ngẫu nhiên trước khi Docker khởi động; giá trị secret không được in ra output. Generator chuẩn hoá image repository thành lowercase và tự chọn host port còn trống trên máy cho cả app lẫn infra, trong khi container port nội bộ giữ nguyên. Nếu project có Python/Go service chưa có Dockerfile, preflight sẽ yêu cầu quyết định thêm Dockerfile hoặc loại service khỏi plan thay vì tạo compose không build được.
 
-Khi gọi qua Claude Code, skill sẽ tự scan project trước. Các lựa chọn chắc chắn từ source được áp dụng tự động; các điểm mơ hồ như thiếu/trùng port, Dockerfile còn thiếu hoặc dependency chỉ gợi ý module sẽ được gom lại hỏi một lượt theo kiểu Grill Me. Sau khi nhận câu trả lời, agent tự chạy tiếp đến cuối — user không phải copy lệnh sang terminal.
+Khi gọi qua Claude Code, skill sẽ tự scan project trước. Các lựa chọn chắc chắn từ source được áp dụng tự động; các điểm mơ hồ như thiếu/trùng/bị chiếm port, Dockerfile còn thiếu, Dockerfile tạo UID/GID cố định, tên app trùng service infra, tên secret Postgres bị trùng sau chuẩn hoá hoặc dependency chỉ gợi ý module sẽ được gom lại hỏi một lượt theo kiểu Grill Me. Với Node service, plan có thể chọn Dockerfile sẵn có (`service`) hoặc fallback do plugin sinh (`generated`); agent không tự sửa Dockerfile của app. Sau khi nhận câu trả lời, agent tự chạy tiếp đến cuối — user không phải copy lệnh sang terminal.
 
 Một số biến thể thường dùng:
 
@@ -107,7 +107,7 @@ Nếu `infra/.env` chưa tồn tại, có thể tạo từ template rồi điề
 cp infra/.env.example infra/.env
 ```
 
-`bootstrap.sh` không tự sinh secret thật. Không commit `infra/.env` hoặc các file chứa credential.
+Các secret local ngẫu nhiên chỉ dùng để bootstrap môi trường dev; plugin không thể tự suy ra credential/realm/client identity của hệ thống bên ngoài. Không commit `infra/.env` hoặc các file chứa credential.
 
 ### Chạy từng tác vụ
 

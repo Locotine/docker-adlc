@@ -34,9 +34,11 @@ Requires: Python 3.8+. No external deps.
 from __future__ import annotations
 
 import argparse
+import errno
 import json
 import re
 import shutil
+import socket
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -95,6 +97,7 @@ class ServiceCandidate:
     has_dockerfile: bool = False
     detected_port: Optional[int] = None
     detected_infra: Set[str] = field(default_factory=set)
+    dockerfile_source: str = "generated"  # service|generated
     # Chosen by user:
     include: bool = True
     host_port: Optional[int] = None
@@ -108,6 +111,7 @@ class InitPlan:
     network_name: str
     services: List[ServiceCandidate]
     infra_modules: List[str]
+    infra_ports: Dict[str, Dict[str, int]] = field(default_factory=dict)
     force: bool = False
 
 
@@ -159,6 +163,7 @@ def scan_candidates(root: Path) -> List[ServiceCandidate]:
             s.language = "go"
             # rudimentary: look at go.sum imports too if available
         s.has_dockerfile = (child / "Dockerfile").exists()
+        s.dockerfile_source = "service" if s.has_dockerfile else "generated"
         out.append(s)
     return out
 
@@ -227,6 +232,143 @@ MODULE_HOST = {
     "elasticsearch": "elasticsearch",
 }
 
+# endpoint -> (container port, preferred host port). Endpoint keys are stable
+# config names; they are not tied to any particular project or service folder.
+INFRA_PORT_SPECS: Dict[str, Dict[str, Tuple[int, int]]] = {
+    "postgres": {"postgres": (5432, 5432)},
+    "redis": {"redis": (6379, 6379)},
+    "kafka": {
+        "kafka": (9092, 9092),
+        "kafka_proxy": (8082, 8082),
+        "kafka_admin": (9644, 9644),
+    },
+    "keycloak": {"keycloak": (8080, 8080)},
+    "temporal": {
+        "temporal": (7233, 7233),
+        "temporal_ui": (8080, 8233),
+    },
+    "minio": {
+        "minio_api": (9000, 9000),
+        "minio_console": (9001, 9001),
+    },
+    "elasticsearch": {"elasticsearch": (9200, 9200)},
+}
+
+# Compose service keys emitted by each infra module. App services share the
+# same merged Compose model, so these names must never overlap.
+INFRA_SERVICE_KEYS: Dict[str, Set[str]] = {
+    "postgres": {"postgres"},
+    "redis": {"redis"},
+    "kafka": {"redpanda"},
+    "keycloak": {"keycloak"},
+    "temporal": {"temporal", "temporal-ui"},
+    "minio": {"minio"},
+    "elasticsearch": {"elasticsearch"},
+}
+
+COMPOSE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
+COMPOSE_SERVICE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+def _normalize_compose_name(value: str, fallback: str = "project") -> str:
+    """Return a Docker Compose project name accepted by the Docker CLI."""
+    normalized = re.sub(r"[^a-z0-9_-]+", "-", value.strip().lower())
+    normalized = normalized.strip("-_")
+    return normalized or fallback
+
+
+def _normalize_image_component(value: str, fallback: str = "app") -> str:
+    """Return a lowercase Docker repository path component."""
+    normalized = re.sub(r"[^a-z0-9._-]+", "-", value.strip().lower())
+    normalized = re.sub(r"[._-]{2,}", "-", normalized).strip("._-")
+    return normalized or fallback
+
+
+def _service_name_is_safe(value: str) -> bool:
+    return COMPOSE_SERVICE_RE.fullmatch(value) is not None
+
+
+def _image_name_collisions(services: List[ServiceCandidate]) -> Dict[str, List[str]]:
+    owners: Dict[str, List[str]] = {}
+    for service in services:
+        owners.setdefault(_normalize_image_component(service.name), []).append(service.name)
+    return {image: names for image, names in owners.items() if len(names) > 1}
+
+
+def _infra_service_names(modules: List[str]) -> Set[str]:
+    return {
+        service_name.casefold()
+        for module in modules
+        for service_name in INFRA_SERVICE_KEYS[module]
+    }
+
+
+def _dockerfile_has_fixed_identity(path: Path) -> bool:
+    """Detect fixed numeric UID/GID creation that may collide with a base image."""
+    try:
+        content = path.read_text()
+    except (OSError, UnicodeError):
+        return False
+    logical_content = re.sub(r"\\\s*\n\s*", " ", content)
+    identity_command = r"(?:groupadd|addgroup|useradd|adduser)"
+    numeric_flag = r"(?:(?:--(?:gid|uid))(?:=|\s+)|-[gu]\s+)\d+"
+    if re.search(
+        rf"\b{identity_command}\b[^\n]*{numeric_flag}",
+        logical_content,
+        re.IGNORECASE,
+    ):
+        return True
+    fixed_args = re.findall(
+        r"^\s*ARG\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*\d+\s*$",
+        content,
+        re.MULTILINE | re.IGNORECASE,
+    )
+    return any(
+        re.search(
+            rf"\b{identity_command}\b[^\n]*\$(?:\{{{re.escape(arg)}\}}|{re.escape(arg)}\b)",
+            logical_content,
+            re.IGNORECASE,
+        )
+        for arg in fixed_args
+    )
+
+
+def _port_is_available(port: int) -> bool:
+    """Best-effort check that Docker can publish a TCP port on all interfaces."""
+    checks = ((socket.AF_INET, "0.0.0.0"),)
+    if socket.has_ipv6:
+        checks += ((socket.AF_INET6, "::"),)
+    for family, host in checks:
+        probe = socket.socket(family, socket.SOCK_STREAM)
+        try:
+            if family == socket.AF_INET6:
+                probe.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+            probe.bind((host, port))
+        except OSError as exc:
+            if family == socket.AF_INET6 and exc.errno in {
+                errno.EAFNOSUPPORT,
+                errno.EADDRNOTAVAIL,
+            }:
+                continue
+            return False
+        finally:
+            probe.close()
+    return True
+
+
+def _next_available_host_port(preferred: int, reserved: Set[int]) -> int:
+    candidate = preferred
+    while candidate <= 65535:
+        if candidate not in reserved and _port_is_available(candidate):
+            return candidate
+        candidate += 1
+    candidate = 1024
+    while candidate < preferred:
+        if candidate not in reserved and _port_is_available(candidate):
+            return candidate
+        candidate += 1
+    raise RuntimeError("no available TCP host port found")
+
 
 def _default_modules(cands: List[ServiceCandidate]) -> List[str]:
     aggregate: Set[str] = set()
@@ -237,14 +379,16 @@ def _default_modules(cands: List[ServiceCandidate]) -> List[str]:
     return [module for module in INFRA_MODULES_ALL if module in aggregate]
 
 
-def _default_ports(cands: List[ServiceCandidate]) -> Dict[str, Tuple[int, int]]:
+def _default_ports(
+    cands: List[ServiceCandidate],
+    reserved: Optional[Set[int]] = None,
+) -> Dict[str, Tuple[int, int]]:
     ports: Dict[str, Tuple[int, int]] = {}
-    used_host_ports: Set[int] = set()
+    used_host_ports: Set[int] = set(reserved or set())
     next_port = 4000
     for service in cands:
-        host_port = service.detected_port or next_port
-        while host_port in used_host_ports:
-            host_port = max(host_port + 1, next_port)
+        preferred = service.detected_port or next_port
+        host_port = _next_available_host_port(preferred, used_host_ports)
         container_port = service.detected_port or 3000
         ports[service.name] = (host_port, container_port)
         used_host_ports.add(host_port)
@@ -252,11 +396,32 @@ def _default_ports(cands: List[ServiceCandidate]) -> Dict[str, Tuple[int, int]]:
     return ports
 
 
+def _default_infra_ports(
+    modules: List[str],
+    reserved: Optional[Set[int]] = None,
+) -> Dict[str, Dict[str, int]]:
+    used_host_ports: Set[int] = set(reserved or set())
+    result: Dict[str, Dict[str, int]] = {}
+    for module in modules:
+        result[module] = {}
+        for endpoint, (_, preferred_host_port) in INFRA_PORT_SPECS[module].items():
+            host_port = _next_available_host_port(preferred_host_port, used_host_ports)
+            result[module][endpoint] = host_port
+            used_host_ports.add(host_port)
+    return result
+
+
 def detection_report(root: Path) -> Dict[str, Any]:
     """Return machine-readable facts and suggested defaults without prompting."""
     cands = scan_candidates(root)
-    project_name = root.name.lower().replace(" ", "-")
-    default_ports = _default_ports(cands)
+    safe_cands = [service for service in cands if _service_name_is_safe(service.name)]
+    project_name = _normalize_compose_name(root.name)
+    default_ports = _default_ports(safe_cands)
+    modules = _default_modules(safe_cands)
+    infra_ports = _default_infra_ports(
+        modules,
+        {host_port for host_port, _ in default_ports.values()},
+    )
     services: Dict[str, Dict[str, Any]] = {}
     uncertainties: List[Dict[str, Any]] = []
     detected_port_owners: Dict[int, str] = {}
@@ -271,6 +436,26 @@ def detection_report(root: Path) -> Dict[str, Any]:
         })
 
     for service in cands:
+        if not _service_name_is_safe(service.name):
+            services[service.name] = {
+                "include": False,
+                "host_port": service.detected_port,
+                "container_port": service.detected_port or 3000,
+                "language": service.language,
+                "has_dockerfile": service.has_dockerfile,
+                "dockerfile": service.dockerfile_source,
+                "detected_port": service.detected_port,
+                "detected_infra": sorted(service.detected_infra),
+            }
+            uncertainties.append({
+                "type": "invalid_service_name",
+                "service": service.name,
+                "question": (
+                    f"Service folder {service.name!r} is not a safe Compose identifier; "
+                    "rename it to letters/digits/dot/underscore/hyphen or keep it excluded?"
+                ),
+            })
+            continue
         host_port, container_port = default_ports[service.name]
         services[service.name] = {
             "include": True,
@@ -278,6 +463,7 @@ def detection_report(root: Path) -> Dict[str, Any]:
             "container_port": container_port,
             "language": service.language,
             "has_dockerfile": service.has_dockerfile,
+            "dockerfile": service.dockerfile_source,
             "detected_port": service.detected_port,
             "detected_infra": sorted(service.detected_infra),
         }
@@ -303,14 +489,48 @@ def detection_report(root: Path) -> Dict[str, Any]:
             })
         else:
             detected_port_owners[service.detected_port] = service.name
+            if host_port != service.detected_port:
+                uncertainties.append({
+                    "type": "host_port_unavailable",
+                    "scope": "service",
+                    "name": service.name,
+                    "service": service.name,
+                    "requested_port": service.detected_port,
+                    "suggested_port": host_port,
+                    "question": (
+                        f"Host port {service.detected_port} for {service.name} is already "
+                        f"reserved or listening; use {host_port} instead?"
+                    ),
+                })
 
-        if service.language != "node" and not service.has_dockerfile:
+        if not service.has_dockerfile:
             uncertainties.append({
                 "type": "missing_dockerfile",
                 "service": service.name,
                 "question": (
                     f"{service.name} is {service.language} and has no Dockerfile; "
-                    "exclude it or add a Dockerfile before bootstrap?"
+                    + (
+                        "use the generated Node Dockerfile or exclude it?"
+                        if service.language == "node"
+                        else "exclude it or add a Dockerfile before bootstrap?"
+                    )
+                ),
+            })
+        elif _dockerfile_has_fixed_identity(service.path / "Dockerfile"):
+            if service.language == "node":
+                dockerfile_question = (
+                    "keep the reviewed service Dockerfile or use the generated Node fallback?"
+                )
+            else:
+                dockerfile_question = (
+                    "review/fix the service Dockerfile or exclude this service before bootstrap?"
+                )
+            uncertainties.append({
+                "type": "dockerfile_fixed_identity",
+                "service": service.name,
+                "question": (
+                    f"{service.name}/Dockerfile creates a user or group with a fixed numeric "
+                    f"UID/GID, which can collide with the base image; {dockerfile_question}"
                 ),
             })
         for dependency, module in AMBIGUOUS_DEP_HINTS.items():
@@ -326,7 +546,65 @@ def detection_report(root: Path) -> Dict[str, Any]:
                     ),
                 })
 
-    modules = _default_modules(cands)
+    for image_name, colliding_services in _image_name_collisions(safe_cands).items():
+        uncertainties.append({
+            "type": "image_name_collision",
+            "image": image_name,
+            "services": colliding_services,
+            "question": (
+                f"Services {', '.join(colliding_services)} normalize to the same Docker image "
+                f"name {image_name!r}; rename or exclude services until every image is unique?"
+            ),
+        })
+
+    infra_service_names = _infra_service_names(modules)
+    for service in safe_cands:
+        if service.name.casefold() in infra_service_names:
+            uncertainties.append({
+                "type": "service_name_conflict",
+                "service": service.name,
+                "infra_modules": [
+                    module
+                    for module in modules
+                    if service.name.casefold()
+                    in {name.casefold() for name in INFRA_SERVICE_KEYS[module]}
+                ],
+                "question": (
+                    f"App service {service.name!r} conflicts with an enabled infra service "
+                    "in the merged Compose model; rename or exclude the app service, or "
+                    "disable the conflicting infra module?"
+                ),
+            })
+
+    for password_key, colliding_services in _db_secret_key_collisions(safe_cands).items():
+        uncertainties.append({
+            "type": "secret_key_collision",
+            "secret_key": password_key,
+            "services": colliding_services,
+            "question": (
+                f"Postgres services {', '.join(colliding_services)} normalize to the same "
+                f"environment secret {password_key}; rename or exclude services until every "
+                "database secret key is unique?"
+            ),
+        })
+
+    for module in modules:
+        for endpoint, (_, preferred_host_port) in INFRA_PORT_SPECS[module].items():
+            suggested_port = infra_ports[module][endpoint]
+            if suggested_port != preferred_host_port:
+                uncertainties.append({
+                    "type": "host_port_unavailable",
+                    "scope": "infra",
+                    "name": f"{module}.{endpoint}",
+                    "module": module,
+                    "endpoint": endpoint,
+                    "requested_port": preferred_host_port,
+                    "suggested_port": suggested_port,
+                    "question": (
+                        f"Host port {preferred_host_port} for {module}.{endpoint} is already "
+                        f"reserved or listening; use {suggested_port} instead?"
+                    ),
+                })
     if cands and not modules:
         uncertainties.append({
             "type": "no_infra_detected",
@@ -341,6 +619,7 @@ def detection_report(root: Path) -> Dict[str, Any]:
             "network_name": project_name,
             "services": services,
             "infra_modules": modules,
+            "infra_ports": infra_ports,
         },
         "uncertainties": uncertainties,
     }
@@ -383,10 +662,31 @@ def build_plan(
 
     print()
     # 1) project meta
-    default_name = root.name.lower().replace(" ", "-")
+    default_name = _normalize_compose_name(root.name)
     if config is not None:
-        project_name = str(config.get("project_name") or default_name)
-        network_name = str(config.get("network_name") or project_name)
+        project_name = config.get("project_name") or default_name
+        network_name = config.get("network_name") or project_name
+        for field_name, field_value, field_pattern, allowed in (
+            (
+                "project_name",
+                project_name,
+                COMPOSE_NAME_RE,
+                "lowercase letters, digits, dashes, or underscores",
+            ),
+            (
+                "network_name",
+                network_name,
+                COMPOSE_SERVICE_RE,
+                "letters, digits, dots, dashes, or underscores",
+            ),
+        ):
+            if not isinstance(field_value, str) or field_pattern.fullmatch(field_value) is None:
+                print(
+                    f"error: config.{field_name} must start with a letter/digit and contain "
+                    f"only {allowed}",
+                    file=sys.stderr,
+                )
+                sys.exit(2)
         print("  --config: using reviewed choices without prompting")
         print(f"  compose project name: {project_name}")
         print(f"  docker network name : {network_name}")
@@ -397,14 +697,16 @@ def build_plan(
         print(f"  compose project name: {project_name}")
         print(f"  docker network name : {network_name}")
     else:
-        project_name = ask("Compose project name (docker -p)", default_name)
-        network_name = ask("Docker network name", project_name)
+        project_name = _normalize_compose_name(ask("Compose project name (docker -p)", default_name))
+        network_name = _normalize_compose_name(ask("Docker network name", project_name))
 
     # 2) per-service confirm + port
     print("\n--- select services to include ---")
     next_port = 4000
     used_host_ports: Set[int] = set()
-    default_ports = _default_ports(cands)
+    default_ports = _default_ports(
+        [service for service in cands if _service_name_is_safe(service.name)]
+    )
     service_config = config.get("services", {}) if config is not None else {}
     if not isinstance(service_config, dict):
         print("error: config.services must be an object keyed by service name", file=sys.stderr)
@@ -430,13 +732,65 @@ def build_plan(
         else:
             s.include = True if assume_defaults else ask_yn(f"include '{s.name}'?", True)
         if s.include:
-            if s.language != "node" and not s.has_dockerfile:
+            if not _service_name_is_safe(s.name):
                 print(
-                    f"error: {s.name} is {s.language} and has no Dockerfile; "
-                    "add one or exclude the service via a reviewed --config plan",
+                    f"error: service folder {s.name!r} is not a safe Compose identifier; "
+                    "rename or exclude it",
                     file=sys.stderr,
                 )
                 sys.exit(2)
+            default_dockerfile = "service" if s.has_dockerfile else "generated"
+            if config is not None:
+                dockerfile_source = choice.get("dockerfile", default_dockerfile)
+            elif (
+                not assume_defaults
+                and s.has_dockerfile
+                and _dockerfile_has_fixed_identity(s.path / "Dockerfile")
+            ):
+                keep_service = ask_yn(
+                    f"  {s.name}/Dockerfile uses a fixed numeric UID/GID; keep it?",
+                    True,
+                )
+                if keep_service:
+                    dockerfile_source = "service"
+                elif s.language == "node":
+                    dockerfile_source = "generated"
+                else:
+                    s.include = False
+                    print(
+                        f"  exclude {s.name}: generated Dockerfiles are only supported "
+                        "for Node services"
+                    )
+                    continue
+            else:
+                dockerfile_source = default_dockerfile
+            if dockerfile_source not in {"service", "generated"}:
+                print(
+                    f"error: config.services.{s.name}.dockerfile must be "
+                    "'service' or 'generated'",
+                    file=sys.stderr,
+                )
+                sys.exit(2)
+            if dockerfile_source == "service" and not s.has_dockerfile:
+                print(
+                    f"error: {s.name} selected its service Dockerfile, but none exists",
+                    file=sys.stderr,
+                )
+                sys.exit(2)
+            if dockerfile_source == "generated" and s.language != "node":
+                if s.has_dockerfile:
+                    message = (
+                        f"{s.name} is {s.language}; generated Dockerfiles are only "
+                        "supported for Node services, so select 'service' or exclude it"
+                    )
+                else:
+                    message = (
+                        f"{s.name} is {s.language} and has no Dockerfile; add one or "
+                        "exclude the service via a reviewed --config plan"
+                    )
+                print(f"error: {message}", file=sys.stderr)
+                sys.exit(2)
+            s.dockerfile_source = str(dockerfile_source)
             default_port = s.detected_port or next_port
             if config is not None or assume_defaults:
                 suggested_host, suggested_container = default_ports[s.name]
@@ -452,6 +806,13 @@ def build_plan(
                 if s.host_port in used_host_ports:
                     print(f"error: duplicate host port {s.host_port} in init config", file=sys.stderr)
                     sys.exit(2)
+                if not _port_is_available(s.host_port):
+                    print(
+                        f"error: selected host port {s.host_port} for {s.name} is currently "
+                        "in use; rerun --detect-json or free the listener",
+                        file=sys.stderr,
+                    )
+                    sys.exit(2)
                 print(
                     f"  include {s.name}: "
                     f"host {s.host_port} -> container {s.container_port}"
@@ -466,7 +827,17 @@ def build_plan(
     if not included:
         print("no services selected. abort.")
         sys.exit(1)
-
+    image_collisions = _image_name_collisions(included)
+    if image_collisions:
+        details = "; ".join(
+            f"{image}: {', '.join(names)}" for image, names in image_collisions.items()
+        )
+        print(
+            f"error: services normalize to duplicate Docker image names ({details}); "
+            "rename or exclude colliding services",
+            file=sys.stderr,
+        )
+        sys.exit(2)
     # 3) aggregate detected infra + prompt each
     aggregate: Set[str] = set()
     for s in included:
@@ -509,12 +880,113 @@ def build_plan(
             if ask_yn(f"  enable '{m}'?", default):
                 modules.append(m)
 
+    infra_service_names = _infra_service_names(modules)
+    service_name_conflicts = [
+        service.name
+        for service in included
+        if service.name.casefold() in infra_service_names
+    ]
+    if service_name_conflicts:
+        print(
+            "error: app service names conflict with enabled infra services in the merged "
+            f"Compose model: {', '.join(service_name_conflicts)}; rename/exclude the app "
+            "services or disable the conflicting modules",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    if "postgres" in modules:
+        secret_key_collisions = _db_secret_key_collisions(included)
+        if secret_key_collisions:
+            details = "; ".join(
+                f"{secret_key}: {', '.join(names)}"
+                for secret_key, names in secret_key_collisions.items()
+            )
+            print(
+                f"error: Postgres services normalize to duplicate environment secret keys "
+                f"({details}); rename/exclude colliding services or disable postgres",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+
+    # 4) host-side infra ports. Container ports stay fixed so app-to-infra URLs
+    # remain stable; only published host ports move when occupied.
+    print("\n--- infra host ports ---")
+    suggested_infra_ports = _default_infra_ports(modules, used_host_ports)
+    configured_infra_ports = config.get("infra_ports", {}) if config is not None else {}
+    if not isinstance(configured_infra_ports, dict):
+        print("error: config.infra_ports must be an object keyed by module", file=sys.stderr)
+        sys.exit(2)
+    unknown_port_modules = set(configured_infra_ports).difference(INFRA_MODULES_ALL)
+    if unknown_port_modules:
+        print(
+            f"error: config.infra_ports contains unknown modules: "
+            f"{', '.join(sorted(unknown_port_modules))}",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+    infra_ports: Dict[str, Dict[str, int]] = {}
+    for module in modules:
+        raw_module_ports = configured_infra_ports.get(module, {})
+        if not isinstance(raw_module_ports, dict):
+            print(f"error: config.infra_ports.{module} must be an object", file=sys.stderr)
+            sys.exit(2)
+        unknown_endpoints = set(raw_module_ports).difference(INFRA_PORT_SPECS[module])
+        if unknown_endpoints:
+            print(
+                f"error: config.infra_ports.{module} contains unknown endpoints: "
+                f"{', '.join(sorted(unknown_endpoints))}",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        infra_ports[module] = {}
+        for endpoint, (container_port, _) in INFRA_PORT_SPECS[module].items():
+            suggested_host = suggested_infra_ports[module][endpoint]
+            if config is not None or assume_defaults:
+                raw_host = raw_module_ports.get(endpoint, suggested_host)
+                try:
+                    host_port = int(raw_host)
+                except (TypeError, ValueError):
+                    print(
+                        f"error: config.infra_ports.{module}.{endpoint} must be an integer",
+                        file=sys.stderr,
+                    )
+                    sys.exit(2)
+            else:
+                host_port = ask_int(
+                    f"  host port for {module}.{endpoint} -> container {container_port}",
+                    suggested_host,
+                )
+            if not 1 <= host_port <= 65535:
+                print(
+                    f"error: host port for {module}.{endpoint} must be between 1 and 65535",
+                    file=sys.stderr,
+                )
+                sys.exit(2)
+            if host_port in used_host_ports:
+                print(
+                    f"error: duplicate host port {host_port} across app/infra config",
+                    file=sys.stderr,
+                )
+                sys.exit(2)
+            if not _port_is_available(host_port):
+                print(
+                    f"error: selected host port {host_port} for {module}.{endpoint} is "
+                    "currently in use; rerun --detect-json or free the listener",
+                    file=sys.stderr,
+                )
+                sys.exit(2)
+            infra_ports[module][endpoint] = host_port
+            used_host_ports.add(host_port)
+            print(f"  {module}.{endpoint}: host {host_port} -> container {container_port}")
+
     return InitPlan(
         project_root=root,
         project_name=project_name,
         network_name=network_name,
         services=included,
         infra_modules=modules,
+        infra_ports=infra_ports,
         force=force,
     )
 
@@ -530,7 +1002,7 @@ INFRA_SERVICE_YAML = {
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: '${{POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in infra/.env}}'
 {postgres_service_env}{postgres_module_env}      POSTGRES_DB: postgres
-    ports: ['5432:5432']
+    ports: ['{postgres_host_port}:5432']
     volumes:
       - pg-data:/var/lib/postgresql/data
       - ./pg-init:/docker-entrypoint-initdb.d:ro
@@ -546,7 +1018,7 @@ INFRA_SERVICE_YAML = {
     container_name: {proj}-redis
     restart: unless-stopped
     command: ['redis-server', '--appendonly', 'yes']
-    ports: ['6379:6379']
+    ports: ['{redis_host_port}:6379']
     volumes:
       - redis-data:/data
     healthcheck:
@@ -569,13 +1041,13 @@ INFRA_SERVICE_YAML = {
       - --node-id=0
       - --check=false
       - --kafka-addr=PLAINTEXT://0.0.0.0:29092,OUTSIDE://0.0.0.0:9092
-      - --advertise-kafka-addr=PLAINTEXT://redpanda:29092,OUTSIDE://localhost:9092
+      - --advertise-kafka-addr=PLAINTEXT://redpanda:29092,OUTSIDE://localhost:{kafka_host_port}
       - --pandaproxy-addr=0.0.0.0:8082
-      - --advertise-pandaproxy-addr=localhost:8082
+      - --advertise-pandaproxy-addr=localhost:{kafka_proxy_host_port}
     ports:
-      - '9092:9092'
-      - '8082:8082'
-      - '9644:9644'
+      - '{kafka_host_port}:9092'
+      - '{kafka_proxy_host_port}:8082'
+      - '{kafka_admin_host_port}:9644'
     volumes:
       - redpanda-data:/var/lib/redpanda/data
     healthcheck:
@@ -600,7 +1072,7 @@ INFRA_SERVICE_YAML = {
       KC_HEALTH_ENABLED: 'true'
       KC_HTTP_ENABLED: 'true'
       KC_HOSTNAME_STRICT: 'false'
-    ports: ['8080:8080']
+    ports: ['{keycloak_host_port}:8080']
     depends_on: {{ postgres: {{ condition: service_healthy }} }}
     volumes:
       - keycloak-data:/opt/keycloak/data
@@ -627,7 +1099,7 @@ INFRA_SERVICE_YAML = {
       VISIBILITY_DBNAME: temporal_visibility
       DEFAULT_NAMESPACE: default
       DEFAULT_NAMESPACE_RETENTION: 24h
-    ports: ['7233:7233']
+    ports: ['{temporal_host_port}:7233']
     depends_on: {{ postgres: {{ condition: service_healthy }} }}
     healthcheck:
       test: ['CMD-SHELL', 'temporal operator cluster health || true']
@@ -644,7 +1116,7 @@ INFRA_SERVICE_YAML = {
     environment:
       TEMPORAL_ADDRESS: temporal:7233
       TEMPORAL_CORS_ORIGINS: http://localhost:3000
-    ports: ['8233:8080']
+    ports: ['{temporal_ui_host_port}:8080']
     depends_on: [temporal]
     networks: [{net}]
 """,
@@ -656,7 +1128,7 @@ INFRA_SERVICE_YAML = {
     environment:
       MINIO_ROOT_USER: '${{MINIO_ROOT_USER:?set MINIO_ROOT_USER in infra/.env}}'
       MINIO_ROOT_PASSWORD: '${{MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD in infra/.env}}'
-    ports: ['9000:9000', '9001:9001']
+    ports: ['{minio_api_host_port}:9000', '{minio_console_host_port}:9001']
     volumes: [minio-data:/data]
     healthcheck:
       test: ['CMD', 'mc', 'ready', 'local']
@@ -673,7 +1145,7 @@ INFRA_SERVICE_YAML = {
       discovery.type: single-node
       xpack.security.enabled: 'false'
       ES_JAVA_OPTS: '-Xms512m -Xmx512m'
-    ports: ['9200:9200']
+    ports: ['{elasticsearch_host_port}:9200']
     volumes: [es-data:/usr/share/elasticsearch/data]
     healthcheck:
       test: ['CMD-SHELL', 'curl -fs http://localhost:9200/_cluster/health | grep -q "\\"status\\":\\"\\(green\\|yellow\\)\\""']
@@ -693,11 +1165,11 @@ MODULE_VOLUMES = {
     "elasticsearch": ["es-data"],
 }
 
-DOCKERFILE_NODE = """# Auto-generated by infra-init. Adjust if project has non-standard build.
+DOCKERFILE_NODE = """# Auto-generated by infra-init. Review if project has a non-standard build.
 FROM node:20-alpine AS deps
 WORKDIR /app
 COPY package*.json ./
-RUN npm ci
+RUN if [ -f package-lock.json ]; then npm ci; else npm install; fi
 
 FROM node:20-alpine AS build
 WORKDIR /app
@@ -716,8 +1188,18 @@ EXPOSE {port}
 HEALTHCHECK --interval=15s --timeout=3s --start-period=30s --retries=3 \\
   CMD curl -fsS http://localhost:{port}/health || exit 1
 ENTRYPOINT ["/sbin/tini", "--"]
+USER node
 CMD ["node", "dist/main.js"]
 """
+
+
+def _infra_template_values(plan: InitPlan) -> Dict[str, int]:
+    values: Dict[str, int] = {}
+    for module, endpoints in INFRA_PORT_SPECS.items():
+        selected = plan.infra_ports.get(module, {})
+        for endpoint, (_, preferred_host_port) in endpoints.items():
+            values[f"{endpoint}_host_port"] = selected.get(endpoint, preferred_host_port)
+    return values
 
 
 def render_infra_yaml(plan: InitPlan) -> str:
@@ -763,6 +1245,7 @@ volumes:
             net=plan.network_name,
             postgres_service_env=postgres_service_env,
             postgres_module_env=postgres_module_env,
+            **_infra_template_values(plan),
         )
     return header + body
 
@@ -779,7 +1262,11 @@ services:
 """
     body = ""
     for s in plan.services:
-        df_path = f"../infra/dockerfiles/Dockerfile.{s.name}" if not s.has_dockerfile else "Dockerfile"
+        df_path = (
+            f"../infra/dockerfiles/Dockerfile.{s.name}"
+            if s.dockerfile_source == "generated"
+            else "Dockerfile"
+        )
         env_lines = _env_for_service(s, plan)
         env_block = "".join(f"      {k}: {_yaml_quote(v)}\n" for k, v in env_lines)
         depends_on = _depends_on(plan)
@@ -787,8 +1274,7 @@ services:
     build:
       context: ../{s.name}
       dockerfile: {df_path}
-    image: {plan.project_name}/{s.name}:local
-    container_name: {s.name}
+    image: {_normalize_image_component(plan.project_name, 'project')}/{_normalize_image_component(s.name)}:local
     restart: unless-stopped
     environment:
       NODE_ENV: staging
@@ -850,6 +1336,7 @@ def _depends_on(plan: InitPlan) -> str:
 
 
 def render_env_example(plan: InitPlan) -> str:
+    keycloak_host_port = _infra_template_values(plan)["keycloak_host_port"]
     lines = [
         "# Copy to `.env` (KHÔNG commit) và điền secret thật.",
         "# Các biến ${VAR:?...} trong docker-compose.apps.yml sẽ đọc từ file này.",
@@ -872,14 +1359,14 @@ def render_env_example(plan: InitPlan) -> str:
             "",
             "# Mint client secret sau khi Keycloak up (thay dp-p2 = realm của bạn):",
             "#   set -a; . ./.env; set +a",
-            "#   TOKEN=$(curl -s -X POST http://localhost:8080/realms/master/protocol/openid-connect/token \\",
+            f"#   TOKEN=$(curl -s -X POST http://localhost:{keycloak_host_port}/realms/master/protocol/openid-connect/token \\",
             "#     -d client_id=admin-cli -d username=admin -d password=\"$KEYCLOAK_ADMIN_PASSWORD\" -d grant_type=password \\",
             "#     | python3 -c 'import json,sys;print(json.load(sys.stdin)[\"access_token\"])')",
             "#   CID=$(curl -s -H \"Authorization: Bearer $TOKEN\" \\",
-            "#     'http://localhost:8080/admin/realms/<REALM>/clients?clientId=<CLIENT>' \\",
+            f"#     'http://localhost:{keycloak_host_port}/admin/realms/<REALM>/clients?clientId=<CLIENT>' \\",
             "#     | python3 -c 'import json,sys;print(json.load(sys.stdin)[0][\"id\"])')",
             "#   curl -s -X POST -H \"Authorization: Bearer $TOKEN\" \\",
-            "#     \"http://localhost:8080/admin/realms/<REALM>/clients/$CID/client-secret\"",
+            f"#     \"http://localhost:{keycloak_host_port}/admin/realms/<REALM>/clients/$CID/client-secret\"",
             "",
             "# EXAMPLE_ADMIN_SECRET=REPLACE_ME",
             "",
@@ -898,6 +1385,14 @@ def render_env_example(plan: InitPlan) -> str:
 def _service_db_password_key(service_name: str) -> str:
     normalized = re.sub(r"[^A-Za-z0-9]+", "_", service_name).strip("_").upper()
     return f"{normalized}_DB_PASSWORD"
+
+
+def _db_secret_key_collisions(services: List[ServiceCandidate]) -> Dict[str, List[str]]:
+    owners: Dict[str, List[str]] = {}
+    for service in services:
+        if "postgres" in service.detected_infra:
+            owners.setdefault(_service_db_password_key(service.name), []).append(service.name)
+    return {secret_key: names for secret_key, names in owners.items() if len(names) > 1}
 
 
 def _sql_identifier(value: str) -> str:
@@ -939,7 +1434,13 @@ def render_readme(plan: InitPlan) -> str:
         f"| {s.name} | {s.host_port} | {s.container_port} |" for s in plan.services
     )
     infra_rows = "\n".join(
-        f"| {plan.project_name}-{MODULE_HOST[m]} | shared |" for m in plan.infra_modules
+        f"| {module}.{endpoint} | {host_port} | {container_port} |"
+        for module in plan.infra_modules
+        for endpoint, (container_port, _) in INFRA_PORT_SPECS[module].items()
+        for host_port in [plan.infra_ports.get(module, {}).get(
+            endpoint,
+            INFRA_PORT_SPECS[module][endpoint][1],
+        )]
     )
     return f"""# {plan.project_name} — Shared Infra
 
@@ -968,8 +1469,8 @@ Or use wrappers:
 
 ## Infra services
 
-| Container | Notes |
-|-----------|-------|
+| Endpoint | Host | Container |
+|----------|------|-----------|
 {infra_rows}
 
 ## Verifying env
@@ -1018,7 +1519,7 @@ def write_plan(plan: InitPlan) -> None:
     df_dir = infra_dir / "dockerfiles"
     df_dir.mkdir()
     for s in plan.services:
-        if not s.has_dockerfile and s.language == "node":
+        if s.dockerfile_source == "generated" and s.language == "node":
             (df_dir / f"Dockerfile.{s.name}").write_text(
                 DOCKERFILE_NODE.format(port=s.container_port)
             )
