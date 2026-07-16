@@ -1,80 +1,89 @@
 ---
 name: infra-init
-description: Scaffold `infra/` directory (shared Docker compose + Dockerfiles + env template + README) for a multi-service project. Interactive or fully automatic with `--yes` — scans sibling folders for candidate services (Node/Python/Go), reads their tech stack (deps in package.json, requirements.txt, go.mod), and selects the needed infra modules (postgres, redis, kafka/redpanda, keycloak, temporal, minio, elasticsearch). Use when starting a new multi-service project, or when the user says "khởi tạo infra", "scaffold docker cho dự án", "tạo compose cho project mới", "generate infra folder".
+description: Audit a multi-service repository and generate local Docker Compose, contract-driven app env, Prisma-aware Node images, Postgres schema reconciliation, and Keycloak/Kafka provisioning. Use for new/fresh projects without infra/.
 ---
 
 # infra-init
 
-Interactive or non-interactive scaffold for shared Docker infrastructure across multiple app services in a repo.
-
-## When to invoke
-
-Trigger this skill when the user wants to bootstrap a Docker setup for a multi-service repo:
-- "khởi tạo infra", "scaffold docker cho dự án mới", "tạo compose"
-- "generate infra folder", "init docker stack", "bootstrap monorepo docker"
-- New folder cloned/created, sibling services exist, but no `infra/` yet
-
-Do **not** trigger for: adding a single service to an existing infra (edit `docker-compose.apps.yml` directly), or when the user is on a single-service project (use their own `Dockerfile` + `docker-compose.yml`).
-
 ## Command
 
 ```bash
-./scripts/infra-init.py [--root <path>] [--force] [--yes | --detect-json | --config <json>]
+./scripts/infra-init.py [--root <path>] [--force]
+                        [--yes | --detect-json | --config <json>]
 ```
 
-Flags:
-- `--root <path>` — project root to scan (default: parent of `scripts/`)
-- `--force` — overwrite existing `infra/` (backs up to `infra.backup.<timestamp>/`)
-- `--yes` / `-y` — include all supported detected services, allocate currently available host ports, use normalized root-derived project/network names, enable detected infra modules, and write without prompting. Postgres is also enabled when required by Keycloak or Temporal. Fails early when a selected Python/Go service has no Dockerfile instead of generating a broken compose plan.
-- `--detect-json` — read-only preflight. Prints candidates, available app/infra port suggestions, Dockerfile strategy, and uncertainty records without prompting or writing.
-- `--config <json>` — generate without prompts from a reviewed config. Accepts either the full `--detect-json` report or its `suggested_config` object.
+- `--detect-json`: read-only facts, suggested reviewed config, and uncertainties.
+- `--config`: generate non-interactively from the full detect report or its
+  `suggested_config`.
+- `--yes`: use only safe defaults; missing required values/start scripts or
+  ambiguous Keycloak ownership still fail and require reviewed config.
+- `--force`: move existing `infra/` to a timestamped backup, regenerate, then
+  preserve old `.env` values and append newly required keys.
 
-## Workflow
+## Audit sources
 
-1. **Scan**: walks project root, finds candidate services (folders with `package.json` / `pyproject.toml` / `requirements.txt` / `go.mod`).
-2. **Detect tech stack** per service from deps:
-   - `prisma|pg|typeorm` → postgres
-   - `redis|ioredis|bullmq` → redis
-   - `kafkajs|@confluentinc/kafka-javascript` → redpanda (kafka)
-   - `openid-client|jose|passport-jwt|keycloak-*` → keycloak
-   - `@temporalio/*` → temporal
-   - `@aws-sdk/client-s3|minio` → minio
-   - `@elastic/elasticsearch` → elasticsearch
-3. **Plan** interactively, or automatically with `--yes`:
-   - Compose project name + docker network name
-   - Include/exclude each detected service, set host port + container port
-   - Choose `service` or `generated` Dockerfile per Node service
-   - Enable/disable each detected infra module (allowing user to override auto-detect)
-   - Set host ports per infra endpoint through `infra_ports`; container ports stay stable
-4. **Preview plan** then confirm.
-5. **Write** to `infra/`:
-   - `docker-compose.infra.yml` — only enabled infra modules
-   - `docker-compose.apps.yml` — app services with env wiring (DATABASE_URL, KAFKA_BROKERS, etc.) matching their detected tech
-   - `dockerfiles/Dockerfile.<service>` — Node template when the reviewed service choice is `generated`
-   - `.env.example` — with cheatsheet for minting Keycloak client secrets
-   - `.gitignore` — excludes `.env`
-   - `README.md` — port map + up/down commands
-   - `pg-init/00-multi-db.sh` — creates DB + role per service (if postgres enabled)
-   - `keycloak-realms/README.md` — placeholder for realm exports (if keycloak enabled)
+For every service, the env contract is the union of:
 
-## Behaviour rules
+- `.env.example` values and `# expected KEY=<regex>` declarations;
+- production-source `getOrThrow`, `get`, `process.env`, and Joi/Zod-style schemas;
+- Prisma `env("KEY")` declarations.
 
-1. **Non-destructive**: refuses to write if `infra/` exists. `--force` backs up first, never deletes silently.
-2. **Automation-safe**: `--yes` and `--config` never read stdin. Agents should use `--detect-json`, ask the user only about reported or evidence-based uncertainties, then use `--config`. Bare `--yes` is for CI or explicit acceptance of all detected defaults. Without these flags, every choice remains interactive. Conflicting app/infra service names and normalized Postgres secret-key collisions are reported for Grill Me and blocked until the reviewed plan renames, excludes, or disables the conflict.
-3. **Host-aware ports**: app and infra host ports share one allocation set and are probed against current TCP listeners. Occupied preferred ports are moved to the next available port and reported as `host_port_unavailable` for review. Internal Compose ports do not change.
-4. **Docker-safe names**: Compose project/network names and generated image repository components are normalized; image paths are always lowercase even when service folders are uppercase. App services do not set global `container_name`, so Compose scopes their container names to the project.
-5. **Node-first**: only generates Dockerfile for Node services. Missing Node Dockerfiles and existing Dockerfiles that create fixed numeric UID/GID identities are reported as uncertainties. The reviewed config selects `services.<name>.dockerfile` as `service` or `generated`; Python/Go Dockerfiles remain the user's responsibility.
-6. **Env wiring per service**: apps compose only wires env vars for infra modules the service actually needs (based on deps). Avoids polluting service env with unused KAFKA_BROKERS etc.
+Tests, mocks, fixtures, generated output and comments are excluded from source
+topic scanning. Versioned Kafka topic literals and `KAFKA_*TOPIC*` values are
+unioned. Env/example drift is reported; the generator never edits app source or
+`.env.example` automatically.
 
-## After running
+## Generated behavior
 
-User should:
-1. `cd infra && cp .env.example .env` and mint real secrets
-2. Drop Keycloak realm exports into `infra/keycloak-realms/` if keycloak enabled
-3. `../scripts/infra-up.sh` to bring everything up
-4. `../scripts/sync-env-docker.py verify <service>` to check env
+- Env keys come from the audited contract, not from dependency guesses.
+- Local infra endpoints are rewritten by key semantics; app-to-app URLs use the
+  discovered service graph or explicit `service_refs`, never port-only guessing.
+- Secrets become required `${VAR:?...}` references in ignored `infra/.env`.
+  The reviewed per-service `secret_keys` list is the explicit classifier override.
+  App secrets are external by default; only keys explicitly listed in
+  `generated_secret_keys` may be minted locally.
+- External endpoints remain visible; required unavailable services fail strict
+  verification instead of silently receiving stubs.
+- Generated Node images use the lowest major satisfying `engines.node` (Node 24
+  LTS fallback), Debian slim in every stage, `/usr/bin/tini`, and the reviewed npm
+  production script.
+- Prisma images copy `prisma/` before install, install OpenSSL/CA certificates and
+  run `prisma generate` explicitly. Migration is a separate one-shot service.
+- Health paths are statically detected with readiness preferred. Config is
+  authoritative; unknown health means no fabricated `/health` check.
+- PostgreSQL provisioning reconciles roles, DBs and every Prisma multiSchema on
+  both fresh and existing volumes. It never appends `?schema=` to `DATABASE_URL`;
+  DB passwords are percent-encoded into a derived URL-only env value.
+- Temporal sets `SKIP_DB_CREATE=true` only for generated internal PostgreSQL.
+- Generated Keycloak reconciliation is local-dev only and uses Admin API updates.
+- Kafka topics are explicit; strict auto-create is disabled only when a complete
+  non-empty topic contract exists. Existing partition/replication/config drift is
+  reconciled when safe or fails explicitly.
+
+## Files
+
+```text
+infra/
+  docker-compose.infra.yml
+  docker-compose.apps.yml
+  contracts/{env,postgres,keycloak,kafka}.json
+  provision/{keycloak.py,kafka.sh}
+  pg-init/00-multi-db.sh
+  dockerfiles/Dockerfile.<service>
+  .env.example
+  .gitignore
+  README.md
+```
+
+## Safety and review
+
+Invalid names, image/secret collisions, occupied ports, fixed UID/GID Dockerfiles,
+unsupported missing Dockerfiles, missing required env values, absent npm start
+scripts and ambiguous realm/client/role ownership are reported before writing.
+Do not convert a generated local realm into a production realm by assumption.
 
 ## Related
 
-- [[infra-up]] / [[infra-down]] / [[docker-apps-up]] — lifecycle
-- [[sync-env-docker]] — env verification after scaffolding
+- [[docker-bootstrap]]: full reviewed flow
+- [[infra-up]]: provision/migrate/start existing generated infra
+- [[sync-env-docker]]: verify generator output against running containers

@@ -1,0 +1,9 @@
+{
+  "name": "d-identity-trust",
+  "engines": {"node": ">=24.0.0"},
+  "scripts": {"build": "nest build", "prod": "node dist/main.js"},
+  "dependencies": {
+    "kafkajs": "2.2.4",
+    "keycloak-admin-client": "26.0.0"
+  }
+}

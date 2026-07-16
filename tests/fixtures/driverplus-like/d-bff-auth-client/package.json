@@ -1,0 +1,6 @@
+{
+  "name": "d-bff-auth-client",
+  "engines": {"node": ">=24.0.0"},
+  "scripts": {"build": "nest build", "prod": "node dist/main.js"},
+  "dependencies": {"jose": "6.0.0"}
+}

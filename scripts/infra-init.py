@@ -23,7 +23,8 @@ Interactive or non-interactive workflow:
         infra/.gitignore
         infra/README.md
         infra/pg-init/00-multi-db.sh                     (if postgres)
-        infra/keycloak-realms/README.md                  (if keycloak — hint drop realm JSON here)
+        infra/contracts/{env,postgres,keycloak,kafka}.json
+        infra/provision/{keycloak.py,kafka.sh}           (when enabled)
 
 Not destructive by default — refuses to overwrite existing infra/ unless `--force`.
 Prints a diff-friendly plan before writing.
@@ -37,12 +38,27 @@ import argparse
 import errno
 import json
 import re
+import shlex
 import shutil
 import socket
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+from docker_contract import (  # noqa: E402
+    ENV_KEY_RE,
+    TOPIC_RE,
+    EnvEvidence,
+    ServiceAudit,
+    audit_service,
+    is_placeholder,
+    is_secret_key,
+)
 
 # ---------- Dependency → infra module map ----------
 
@@ -98,6 +114,20 @@ class ServiceCandidate:
     detected_port: Optional[int] = None
     detected_infra: Set[str] = field(default_factory=set)
     dockerfile_source: str = "generated"  # service|generated
+    audit: Optional[ServiceAudit] = None
+    env_values: Dict[str, Optional[str]] = field(default_factory=dict)
+    secret_keys: Set[str] = field(default_factory=set)
+    generated_secret_keys: Set[str] = field(default_factory=set)
+    service_refs: Dict[str, str] = field(default_factory=dict)
+    health_path: Optional[str] = None
+    start_script: Optional[str] = None
+    build_script: Optional[str] = None
+    base_image: str = "node:24-slim"
+    migration_mode: str = "disabled"  # auto|disabled
+    db_schemas: List[str] = field(default_factory=list)
+    db_name: Optional[str] = None
+    db_role: Optional[str] = None
+    db_password_env: Optional[str] = None
     # Chosen by user:
     include: bool = True
     host_port: Optional[int] = None
@@ -112,6 +142,8 @@ class InitPlan:
     services: List[ServiceCandidate]
     infra_modules: List[str]
     infra_ports: Dict[str, Dict[str, int]] = field(default_factory=dict)
+    keycloak_spec: Dict[str, Any] = field(default_factory=dict)
+    kafka_spec: Dict[str, Any] = field(default_factory=dict)
     force: bool = False
 
 
@@ -164,6 +196,32 @@ def scan_candidates(root: Path) -> List[ServiceCandidate]:
             # rudimentary: look at go.sum imports too if available
         s.has_dockerfile = (child / "Dockerfile").exists()
         s.dockerfile_source = "service" if s.has_dockerfile else "generated"
+        s.audit = audit_service(child, s.name)
+        s.start_script = s.audit.start_script
+        s.build_script = s.audit.build_script
+        s.health_path = s.audit.health_candidates[0] if s.audit.health_candidates else None
+        s.base_image = f"node:{s.audit.node_major}-slim"
+        s.migration_mode = "auto" if s.audit.prisma else "disabled"
+        s.db_schemas = list(s.audit.prisma_schemas)
+        s.db_name = s.name
+        s.db_role = s.name
+        s.db_password_env = _service_db_password_key(s.name)
+        for key in s.audit.env:
+            prefix = key.upper()
+            if prefix.startswith("REDIS_"):
+                s.detected_infra.add("redis")
+            if prefix.startswith("KAFKA_"):
+                s.detected_infra.add("kafka")
+            if prefix.startswith("KEYCLOAK_"):
+                s.detected_infra.add("keycloak")
+            if prefix.startswith("TEMPORAL_"):
+                s.detected_infra.add("temporal")
+            if prefix.startswith(("DATABASE_", "POSTGRES_")):
+                s.detected_infra.add("postgres")
+        if s.audit.prisma:
+            s.detected_infra.add("postgres")
+        if s.audit.topics:
+            s.detected_infra.add("kafka")
         out.append(s)
     return out
 
@@ -411,6 +469,278 @@ def _default_infra_ports(
     return result
 
 
+def _default_service_contract(service: ServiceCandidate) -> Dict[str, Any]:
+    audit = service.audit or ServiceAudit(name=service.name)
+    env = {
+        key: item.value
+        for key, item in audit.env.items()
+        if item.value is not None
+    }
+    secret_keys = sorted(key for key, item in audit.env.items() if item.secret)
+    return {
+        "env": env,
+        "secret_keys": secret_keys,
+        # App credentials are external by default.  A reviewed plan may opt a
+        # key into local random generation explicitly.
+        "generated_secret_keys": [],
+        "service_refs": {},
+        "health_path": service.health_path,
+        "start_script": service.start_script,
+        "build_script": service.build_script,
+        "base_image": service.base_image,
+        "migration": {"mode": service.migration_mode},
+        "database": {
+            "name": service.db_name or service.name,
+            "owner": service.db_role or service.name,
+            "password_env": service.db_password_env or _service_db_password_key(service.name),
+            "schemas": list(service.db_schemas),
+        },
+        "detected_contract": audit.to_dict(),
+    }
+
+
+def _key_suffix(key: str, marker: str) -> str:
+    _, _, suffix = key.partition(marker)
+    return suffix.strip("_")
+
+
+def _default_keycloak_spec(services: List[ServiceCandidate]) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    realms: Dict[str, Dict[str, Any]] = {}
+    realm_suffixes: Dict[str, str] = {}
+    pending_roles: List[Tuple[str, str]] = []
+    pending_client_roles: List[Tuple[str, str, str, str]] = []
+    pending_clients: List[Dict[str, Any]] = []
+    uncertainties: List[Dict[str, Any]] = []
+
+    for service in services:
+        audit = service.audit or ServiceAudit(name=service.name)
+        audiences = [
+            (key, item.value)
+            for key, item in audit.env.items()
+            if "AUDIENCE" in key and item.value and not is_placeholder(item.value)
+        ]
+        for key, item in audit.env.items():
+            value = item.value
+            if not value or is_placeholder(value):
+                continue
+            if "REALM" in key and re.fullmatch(r"[A-Za-z0-9._-]+", value):
+                realms.setdefault(value, {"name": value, "roles": [], "clients": []})
+                realm_suffixes[_key_suffix(key, "REALM")] = value
+            for match in re.findall(r"/realms/([^/\s]+)", value):
+                realms.setdefault(match, {"name": match, "roles": [], "clients": []})
+
+    def resolve_realm(key: str) -> Optional[str]:
+        matching = [
+            realm
+            for suffix, realm in realm_suffixes.items()
+            if suffix and (key.endswith(suffix) or suffix.endswith(_key_suffix(key, "AUDIENCE")))
+        ]
+        if len(set(matching)) == 1:
+            return matching[0]
+        if len(realms) == 1:
+            return next(iter(realms))
+        return None
+
+    for service in services:
+        audit = service.audit or ServiceAudit(name=service.name)
+        for key, item in audit.env.items():
+            value = item.value
+            if not value or is_placeholder(value):
+                continue
+            if "AUDIENCE" in key:
+                pending_clients.append({
+                    "client_id": value,
+                    "realm": resolve_realm(key),
+                    "kind": "public",
+                    "roles": [],
+                    "source": f"{service.name}:{key}",
+                })
+            if "ROLE" in key and audit.realm_access_claim:
+                pending_roles.append((value, resolve_realm(key) or ""))
+            if "ROLE" in key and audit.resource_access_claim:
+                if len(audiences) == 1:
+                    audience_key, client_id = audiences[0]
+                    pending_client_roles.append((
+                        client_id or "",
+                        value,
+                        resolve_realm(audience_key) or "",
+                        service.name,
+                    ))
+                else:
+                    uncertainties.append({
+                        "type": "keycloak_client_role_owner_ambiguous",
+                        "role": value,
+                        "service": service.name,
+                        "question": (
+                            f"Which Keycloak resource client owns client role {value!r} "
+                            f"read by {service.name}?"
+                        ),
+                    })
+            if key.endswith("_CLIENT_ID"):
+                secret_key = key[:-len("_CLIENT_ID")] + "_CLIENT_SECRET"
+                if secret_key in audit.env:
+                    pending_clients.append({
+                        "client_id": value,
+                        "realm": resolve_realm(key),
+                        "kind": "service-account",
+                        "roles": [],
+                        "secret_env": secret_key,
+                        "source": f"{service.name}:{key}",
+                    })
+
+    for role, realm in pending_roles:
+        if realm:
+            realms[realm]["roles"].append(role)
+        else:
+            uncertainties.append({
+                "type": "keycloak_role_realm_ambiguous",
+                "role": role,
+                "question": f"Which detected Keycloak realm owns realm role {role!r}?",
+            })
+    for client in pending_clients:
+        realm = client.pop("realm")
+        if realm:
+            realms[realm]["clients"].append(client)
+        else:
+            uncertainties.append({
+                "type": "keycloak_client_realm_ambiguous",
+                "client": client["client_id"],
+                "source": client["source"],
+                "question": (
+                    f"Which detected Keycloak realm owns client {client['client_id']!r}?"
+                ),
+            })
+    for client_id, role, realm, service_name in pending_client_roles:
+        if not realm:
+            uncertainties.append({
+                "type": "keycloak_client_role_realm_ambiguous",
+                "client": client_id,
+                "role": role,
+                "service": service_name,
+                "question": (
+                    f"Which detected realm owns client role {client_id}/{role}?"
+                ),
+            })
+            continue
+        matching = [
+            client for client in realms[realm]["clients"]
+            if client["client_id"] == client_id
+        ]
+        if matching:
+            matching[0].setdefault("roles", []).append(role)
+        else:
+            uncertainties.append({
+                "type": "keycloak_client_role_owner_ambiguous",
+                "client": client_id,
+                "role": role,
+                "service": service_name,
+                "question": f"Add client {client_id!r} to realm {realm!r} for role {role!r}?",
+            })
+    for realm in realms.values():
+        realm["roles"] = sorted(set(realm["roles"]))
+        unique_clients: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        for client in realm["clients"]:
+            key = (client["client_id"], client["kind"])
+            if key in unique_clients:
+                unique_clients[key].setdefault("roles", []).extend(client.get("roles", []))
+            else:
+                unique_clients[key] = client
+        for client in unique_clients.values():
+            client["roles"] = sorted(set(client.get("roles", [])))
+        realm["clients"] = sorted(unique_clients.values(), key=lambda item: item["client_id"])
+    return {
+        "mode": "generated-local",
+        "realms": sorted(realms.values(), key=lambda item: item["name"]),
+        "seed_users": [],
+    }, uncertainties
+
+
+def _default_kafka_spec(services: List[ServiceCandidate]) -> Dict[str, Any]:
+    topics = sorted({topic for service in services for topic in (service.audit.topics if service.audit else [])})
+    return {
+        "strict": bool(topics),
+        "topics": [
+            {"name": topic, "partitions": 1, "replication_factor": 1, "config": {}}
+            for topic in topics
+        ],
+    }
+
+
+def _contract_uncertainties(service: ServiceCandidate) -> List[Dict[str, Any]]:
+    audit = service.audit or ServiceAudit(name=service.name)
+    uncertainties: List[Dict[str, Any]] = []
+    drift = sorted(audit.code_env_keys.difference(audit.env_example_keys))
+    if drift:
+        uncertainties.append({
+            "type": "env_contract_drift",
+            "service": service.name,
+            "keys": drift,
+            "question": (
+                f"{service.name} reads env keys absent from .env.example: {', '.join(drift)}. "
+                "Review values and optionally patch the service contract?"
+            ),
+        })
+    missing_required = sorted(
+        key for key, item in audit.env.items()
+        if item.required and item.value is None and not item.secret
+    )
+    if missing_required:
+        uncertainties.append({
+            "type": "missing_required_env_value",
+            "service": service.name,
+            "keys": missing_required,
+            "question": (
+                f"Required env values for {service.name} cannot be derived: "
+                f"{', '.join(missing_required)}. What values should the reviewed plan use?"
+            ),
+        })
+    missing_required_secrets = sorted(
+        key for key, item in audit.env.items()
+        if item.required and item.value is None and item.secret
+    )
+    if missing_required_secrets:
+        uncertainties.append({
+            "type": "missing_required_secret",
+            "service": service.name,
+            "keys": missing_required_secrets,
+            "question": (
+                f"Required secrets for {service.name} have no local source: "
+                f"{', '.join(missing_required_secrets)}. Supply them in infra/.env, "
+                "or explicitly add only locally-mintable keys to generated_secret_keys?"
+            ),
+        })
+    if service.language == "node" and service.dockerfile_source == "generated":
+        if not audit.start_script:
+            uncertainties.append({
+                "type": "missing_start_script",
+                "service": service.name,
+                "question": (
+                    f"{service.name} has neither npm script 'prod' nor 'start:prod'; "
+                    "which reviewed start script should the generated image run?"
+                ),
+            })
+        if not audit.build_script:
+            uncertainties.append({
+                "type": "missing_build_script",
+                "service": service.name,
+                "question": (
+                    f"{service.name} has no npm build script; which reviewed script should "
+                    "the generated image run?"
+                ),
+            })
+    if audit.prisma and service.dockerfile_source == "service":
+        uncertainties.append({
+            "type": "custom_prisma_migration_image",
+            "service": service.name,
+            "question": (
+                f"{service.name} uses its own Dockerfile; confirm its runtime image contains "
+                "the Prisma CLI and prisma/ schema for the generated one-shot migration, "
+                "or set migration.mode=disabled?"
+            ),
+        })
+    return uncertainties
+
+
 def detection_report(root: Path) -> Dict[str, Any]:
     """Return machine-readable facts and suggested defaults without prompting."""
     cands = scan_candidates(root)
@@ -466,7 +796,9 @@ def detection_report(root: Path) -> Dict[str, Any]:
             "dockerfile": service.dockerfile_source,
             "detected_port": service.detected_port,
             "detected_infra": sorted(service.detected_infra),
+            **_default_service_contract(service),
         }
+        uncertainties.extend(_contract_uncertainties(service))
         if service.detected_port is None:
             uncertainties.append({
                 "type": "missing_port",
@@ -503,7 +835,7 @@ def detection_report(root: Path) -> Dict[str, Any]:
                     ),
                 })
 
-        if not service.has_dockerfile:
+        if not service.has_dockerfile and service.language != "node":
             uncertainties.append({
                 "type": "missing_dockerfile",
                 "service": service.name,
@@ -611,6 +943,11 @@ def detection_report(root: Path) -> Dict[str, Any]:
             "question": "No infra modules were detected; should bootstrap run apps without shared infra?",
         })
 
+    keycloak_spec, keycloak_uncertainties = _default_keycloak_spec(safe_cands)
+    if "keycloak" in modules:
+        uncertainties.extend(keycloak_uncertainties)
+    kafka_spec = _default_kafka_spec(safe_cands)
+
     return {
         "project_root": str(root),
         "candidates": sorted(services),
@@ -620,6 +957,8 @@ def detection_report(root: Path) -> Dict[str, Any]:
             "services": services,
             "infra_modules": modules,
             "infra_ports": infra_ports,
+            "keycloak": keycloak_spec,
+            "kafka": kafka_spec,
         },
         "uncertainties": uncertainties,
     }
@@ -639,6 +978,308 @@ def load_plan_config(path: Path) -> Dict[str, Any]:
     if isinstance(suggested, dict):
         config = suggested
     return config
+
+
+BASE_IMAGE_RE = re.compile(r"^[a-z0-9][a-z0-9./:_@-]*$")
+PG_SCHEMA_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]*$")
+
+
+def _config_error(message: str) -> None:
+    print(f"error: {message}", file=sys.stderr)
+    sys.exit(2)
+
+
+def _apply_service_contract_config(
+    service: ServiceCandidate,
+    choice: Dict[str, Any],
+) -> None:
+    """Validate and apply the reviewed, per-service runtime contract."""
+    audit = service.audit or ServiceAudit(name=service.name)
+    raw_env = choice.get("env", {})
+    if not isinstance(raw_env, dict):
+        _config_error(f"config.services.{service.name}.env must be an object")
+    env_values: Dict[str, Optional[str]] = {}
+    for key, item in audit.env.items():
+        if item.required or item.value is not None or "schema" in " ".join(item.sources):
+            env_values[key] = item.value
+    for key, value in raw_env.items():
+        if not isinstance(key, str) or ENV_KEY_RE.fullmatch(key) is None:
+            _config_error(
+                f"config.services.{service.name}.env contains invalid key {key!r}"
+            )
+        if value is not None and not isinstance(value, (str, int, float, bool)):
+            _config_error(
+                f"config.services.{service.name}.env.{key} must be scalar or null"
+            )
+        env_values[key] = None if value is None else str(value)
+    raw_secret_keys = choice.get(
+        "secret_keys",
+        [key for key, item in audit.env.items() if item.secret],
+    )
+    if not isinstance(raw_secret_keys, list) or not all(
+        isinstance(key, str) and ENV_KEY_RE.fullmatch(key) for key in raw_secret_keys
+    ):
+        _config_error(f"config.services.{service.name}.secret_keys must be env key names")
+    service.secret_keys = set(raw_secret_keys)
+    raw_generated_secret_keys = choice.get("generated_secret_keys", [])
+    if not isinstance(raw_generated_secret_keys, list) or not all(
+        isinstance(key, str) and ENV_KEY_RE.fullmatch(key)
+        for key in raw_generated_secret_keys
+    ):
+        _config_error(
+            f"config.services.{service.name}.generated_secret_keys must be env key names"
+        )
+    service.generated_secret_keys = set(raw_generated_secret_keys)
+    unknown_generated = service.generated_secret_keys.difference(service.secret_keys)
+    if unknown_generated:
+        _config_error(
+            f"generated secrets for {service.name} must also appear in secret_keys: "
+            f"{', '.join(sorted(unknown_generated))}"
+        )
+    missing = sorted(
+        key
+        for key, item in audit.env.items()
+        if item.required
+        and key not in service.secret_keys
+        and (env_values.get(key) in {None, ""} or is_placeholder(env_values.get(key)))
+    )
+    if missing:
+        _config_error(
+            f"required env values for {service.name} need reviewed config: "
+            f"{', '.join(missing)}"
+        )
+    service.env_values = env_values
+
+    raw_refs = choice.get("service_refs", {})
+    if not isinstance(raw_refs, dict):
+        _config_error(f"config.services.{service.name}.service_refs must be an object")
+    refs: Dict[str, str] = {}
+    for key, target in raw_refs.items():
+        if not isinstance(key, str) or ENV_KEY_RE.fullmatch(key) is None:
+            _config_error(
+                f"config.services.{service.name}.service_refs contains invalid key {key!r}"
+            )
+        if not isinstance(target, str) or not _service_name_is_safe(target):
+            _config_error(
+                f"config.services.{service.name}.service_refs.{key} must name a service"
+            )
+        refs[key] = target
+    service.service_refs = refs
+
+    health_path = choice.get("health_path", service.health_path)
+    if health_path is False:
+        health_path = None
+    if health_path is not None and (
+        not isinstance(health_path, str)
+        or not health_path.startswith("/")
+        or any(char.isspace() for char in health_path)
+    ):
+        _config_error(
+            f"config.services.{service.name}.health_path must start with '/' or be null"
+        )
+    service.health_path = health_path
+
+    start_script = choice.get("start_script", service.start_script)
+    if start_script is not None and (
+        not isinstance(start_script, str)
+        or not re.fullmatch(r"[A-Za-z0-9:_-]+", start_script)
+    ):
+        _config_error(
+            f"config.services.{service.name}.start_script must be an npm script name"
+        )
+    if service.dockerfile_source == "generated" and service.language == "node" and not start_script:
+        _config_error(
+            f"{service.name} needs a reviewed start_script because package.json has "
+            "neither 'prod' nor 'start:prod'"
+        )
+    service.start_script = start_script
+
+    build_script = choice.get("build_script", service.build_script)
+    if build_script is not None and (
+        not isinstance(build_script, str)
+        or not re.fullmatch(r"[A-Za-z0-9:_-]+", build_script)
+    ):
+        _config_error(
+            f"config.services.{service.name}.build_script must be an npm script name"
+        )
+    if service.dockerfile_source == "generated" and service.language == "node" and not build_script:
+        _config_error(
+            f"{service.name} needs a reviewed build_script because package.json has no 'build'"
+        )
+    service.build_script = build_script
+
+    base_image = choice.get("base_image", service.base_image)
+    if not isinstance(base_image, str) or BASE_IMAGE_RE.fullmatch(base_image) is None:
+        _config_error(f"config.services.{service.name}.base_image is not a safe image reference")
+    if service.dockerfile_source == "generated" and "slim" not in base_image:
+        _config_error(
+            f"generated Dockerfile for {service.name} requires a Debian slim base image"
+        )
+    service.base_image = base_image
+
+    migration = choice.get("migration", {"mode": service.migration_mode})
+    if not isinstance(migration, dict) or migration.get("mode", service.migration_mode) not in {
+        "auto", "disabled"
+    }:
+        _config_error(
+            f"config.services.{service.name}.migration.mode must be 'auto' or 'disabled'"
+        )
+    service.migration_mode = str(migration.get("mode", service.migration_mode))
+    if service.migration_mode == "auto" and not audit.prisma:
+        _config_error(f"auto migration for {service.name} requires a detected Prisma service")
+
+    database = choice.get("database", {"schemas": service.db_schemas})
+    if not isinstance(database, dict):
+        _config_error(f"config.services.{service.name}.database must be an object")
+    schemas = database.get("schemas", service.db_schemas)
+    if not isinstance(schemas, list) or not all(
+        isinstance(schema, str) and PG_SCHEMA_RE.fullmatch(schema) for schema in schemas
+    ):
+        _config_error(
+            f"config.services.{service.name}.database.schemas must be safe schema names"
+        )
+    service.db_schemas = sorted(set(schemas))
+    db_name = database.get("name", service.db_name or service.name)
+    db_role = database.get("owner", service.db_role or service.name)
+    password_env = database.get(
+        "password_env",
+        service.db_password_env or _service_db_password_key(service.name),
+    )
+    if not isinstance(db_name, str) or PG_SCHEMA_RE.fullmatch(db_name) is None:
+        _config_error(f"config.services.{service.name}.database.name is invalid")
+    if not isinstance(db_role, str) or PG_SCHEMA_RE.fullmatch(db_role) is None:
+        _config_error(f"config.services.{service.name}.database.owner is invalid")
+    if not isinstance(password_env, str) or ENV_KEY_RE.fullmatch(password_env) is None:
+        _config_error(f"config.services.{service.name}.database.password_env is invalid")
+    service.db_name = db_name
+    service.db_role = db_role
+    service.db_password_env = password_env
+
+
+def _validate_keycloak_spec(raw: Any) -> Dict[str, Any]:
+    if not isinstance(raw, dict):
+        _config_error("config.keycloak must be an object")
+    mode = raw.get("mode", "generated-local")
+    if mode not in {"generated-local", "official"}:
+        _config_error("config.keycloak.mode must be 'generated-local' or 'official'")
+    realms = raw.get("realms", [])
+    if not isinstance(realms, list):
+        _config_error("config.keycloak.realms must be a list")
+    normalized: List[Dict[str, Any]] = []
+    seen_realms: Set[str] = set()
+    for realm in realms:
+        if not isinstance(realm, dict):
+            _config_error("each config.keycloak.realms item must be an object")
+        name = realm.get("name")
+        if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9._-]+", name):
+            _config_error("each Keycloak realm needs a safe name")
+        if name in seen_realms:
+            _config_error(f"duplicate Keycloak realm {name!r}")
+        seen_realms.add(name)
+        roles = realm.get("roles", [])
+        clients = realm.get("clients", [])
+        if not isinstance(roles, list) or not all(isinstance(role, str) and role for role in roles):
+            _config_error(f"Keycloak realm {name} roles must be non-empty strings")
+        if not isinstance(clients, list):
+            _config_error(f"Keycloak realm {name} clients must be a list")
+        normalized_clients: List[Dict[str, Any]] = []
+        for client in clients:
+            if not isinstance(client, dict) or not isinstance(client.get("client_id"), str):
+                _config_error(f"Keycloak realm {name} has an invalid client")
+            kind = client.get("kind", "public")
+            if kind not in {"public", "service-account"}:
+                _config_error(f"Keycloak client {client['client_id']} has invalid kind")
+            normalized_client = {
+                "client_id": client["client_id"],
+                "kind": kind,
+            }
+            client_roles = client.get("roles", [])
+            if not isinstance(client_roles, list) or not all(
+                isinstance(role, str) and role for role in client_roles
+            ):
+                _config_error(
+                    f"Keycloak client {client['client_id']} roles must be non-empty strings"
+                )
+            normalized_client["roles"] = sorted(set(client_roles))
+            if kind == "service-account":
+                secret_env = client.get("secret_env")
+                if not isinstance(secret_env, str) or ENV_KEY_RE.fullmatch(secret_env) is None:
+                    _config_error(
+                        f"service-account client {client['client_id']} needs secret_env"
+                    )
+                normalized_client["secret_env"] = secret_env
+            normalized_clients.append(normalized_client)
+        normalized.append({
+            "name": name,
+            "roles": sorted(set(roles)),
+            "clients": normalized_clients,
+        })
+    seed_users = raw.get("seed_users", [])
+    if not isinstance(seed_users, list):
+        _config_error("config.keycloak.seed_users must be a list")
+    normalized_users: List[Dict[str, Any]] = []
+    for user in seed_users:
+        if not isinstance(user, dict):
+            _config_error("each Keycloak seed user must be an object")
+        realm = user.get("realm")
+        username = user.get("username")
+        password_env = user.get("password_env")
+        roles = user.get("realm_roles", [])
+        if realm not in seen_realms or not isinstance(username, str) or not username:
+            _config_error("each Keycloak seed user needs a known realm and username")
+        if not isinstance(password_env, str) or ENV_KEY_RE.fullmatch(password_env) is None:
+            _config_error(f"Keycloak seed user {username} needs password_env")
+        if not isinstance(roles, list) or not all(isinstance(role, str) for role in roles):
+            _config_error(f"Keycloak seed user {username} realm_roles must be strings")
+        normalized_users.append({
+            "realm": realm,
+            "username": username,
+            "password_env": password_env,
+            "realm_roles": sorted(set(roles)),
+        })
+    return {"mode": mode, "realms": normalized, "seed_users": normalized_users}
+
+
+def _validate_kafka_spec(raw: Any) -> Dict[str, Any]:
+    if not isinstance(raw, dict):
+        _config_error("config.kafka must be an object")
+    strict = raw.get("strict", True)
+    topics = raw.get("topics", [])
+    if not isinstance(strict, bool) or not isinstance(topics, list):
+        _config_error("config.kafka requires boolean strict and list topics")
+    normalized: List[Dict[str, Any]] = []
+    seen: Set[str] = set()
+    for topic in topics:
+        if not isinstance(topic, dict) or not isinstance(topic.get("name"), str):
+            _config_error("each config.kafka.topics item must be an object with name")
+        name = topic["name"]
+        if TOPIC_RE.fullmatch(name) is None:
+            _config_error(f"Kafka topic {name!r} does not match the versioned topic contract")
+        try:
+            partitions = int(topic.get("partitions", 1))
+            replicas = int(topic.get("replication_factor", 1))
+        except (TypeError, ValueError):
+            _config_error(f"Kafka topic {name!r} partition/replication values must be integers")
+        if partitions < 1 or replicas != 1:
+            _config_error(
+                f"local single-broker topic {name!r} needs partitions>=1 and replication_factor=1"
+            )
+        topic_config = topic.get("config", {})
+        if not isinstance(topic_config, dict) or not all(
+            isinstance(key, str) and isinstance(value, (str, int, float, bool))
+            for key, value in topic_config.items()
+        ):
+            _config_error(f"Kafka topic {name!r} config must contain scalar values")
+        if name in seen:
+            _config_error(f"duplicate Kafka topic {name!r}")
+        seen.add(name)
+        normalized.append({
+            "name": name,
+            "partitions": partitions,
+            "replication_factor": replicas,
+            "config": {key: str(value) for key, value in sorted(topic_config.items())},
+        })
+    return {"strict": strict, "topics": sorted(normalized, key=lambda item: item["name"])}
 
 
 def build_plan(
@@ -791,6 +1432,27 @@ def build_plan(
                 print(f"error: {message}", file=sys.stderr)
                 sys.exit(2)
             s.dockerfile_source = str(dockerfile_source)
+            if config is None and not assume_defaults:
+                choice = dict(choice)
+                if s.language == "node" and s.dockerfile_source == "generated" and not s.start_script:
+                    choice["start_script"] = ask(
+                        f"  npm start script for {s.name} (for example prod or start:prod)"
+                    )
+                if s.language == "node" and s.dockerfile_source == "generated" and not s.build_script:
+                    choice["build_script"] = ask(
+                        f"  npm build script for {s.name}"
+                    )
+                missing_values = [
+                    key
+                    for key, item in (s.audit.env if s.audit else {}).items()
+                    if item.required and not item.secret and item.value in {None, ""}
+                ]
+                if missing_values:
+                    reviewed_env = dict(choice.get("env", {}))
+                    for key in missing_values:
+                        reviewed_env[key] = ask(f"  value for required {s.name}.{key}")
+                    choice["env"] = reviewed_env
+            _apply_service_contract_config(s, choice)
             default_port = s.detected_port or next_port
             if config is not None or assume_defaults:
                 suggested_host, suggested_container = default_ports[s.name]
@@ -827,6 +1489,14 @@ def build_plan(
     if not included:
         print("no services selected. abort.")
         sys.exit(1)
+    included_names = {service.name for service in included}
+    for service in included:
+        unknown_refs = set(service.service_refs.values()).difference(included_names)
+        if unknown_refs:
+            _config_error(
+                f"service refs for {service.name} target excluded/unknown services: "
+                f"{', '.join(sorted(unknown_refs))}"
+            )
     image_collisions = _image_name_collisions(included)
     if image_collisions:
         details = "; ".join(
@@ -907,6 +1577,16 @@ def build_plan(
                 file=sys.stderr,
             )
             sys.exit(2)
+        shared_conflicts = _shared_db_conflicts(included)
+        if shared_conflicts:
+            details = "; ".join(
+                f"{database}: {', '.join(names)}"
+                for database, names in shared_conflicts.items()
+            )
+            _config_error(
+                "services sharing a Postgres database must use the same reviewed owner "
+                f"and password_env ({details})"
+            )
 
     # 4) host-side infra ports. Container ports stay fixed so app-to-infra URLs
     # remain stable; only published host ports move when occupied.
@@ -980,6 +1660,23 @@ def build_plan(
             used_host_ports.add(host_port)
             print(f"  {module}.{endpoint}: host {host_port} -> container {container_port}")
 
+    default_keycloak, keycloak_uncertainties = _default_keycloak_spec(included)
+    raw_keycloak = config.get("keycloak", default_keycloak) if config is not None else default_keycloak
+    if "keycloak" in modules and keycloak_uncertainties:
+        unresolved = ", ".join(
+            item.get("client") or item.get("role") or "unknown"
+            for item in keycloak_uncertainties
+        )
+        if config is None or raw_keycloak == default_keycloak:
+            _config_error(
+                "Keycloak ownership is ambiguous for "
+                f"{unresolved}; run --detect-json and provide a reviewed config.keycloak"
+            )
+    keycloak_spec = _validate_keycloak_spec(raw_keycloak)
+    default_kafka = _default_kafka_spec(included)
+    raw_kafka = config.get("kafka", default_kafka) if config is not None else default_kafka
+    kafka_spec = _validate_kafka_spec(raw_kafka)
+
     return InitPlan(
         project_root=root,
         project_name=project_name,
@@ -987,6 +1684,8 @@ def build_plan(
         services=included,
         infra_modules=modules,
         infra_ports=infra_ports,
+        keycloak_spec=keycloak_spec,
+        kafka_spec=kafka_spec,
         force=force,
     )
 
@@ -1061,7 +1760,7 @@ INFRA_SERVICE_YAML = {
     image: quay.io/keycloak/keycloak:24.0
     container_name: {proj}-keycloak
     restart: unless-stopped
-    command: [start-dev, --http-port=8080, --hostname-strict=false, --import-realm]
+    command: [start-dev, --http-port=8080, --hostname-strict=false]
     environment:
       KEYCLOAK_ADMIN: admin
       KEYCLOAK_ADMIN_PASSWORD: '${{KEYCLOAK_ADMIN_PASSWORD:?set KEYCLOAK_ADMIN_PASSWORD in infra/.env}}'
@@ -1076,7 +1775,6 @@ INFRA_SERVICE_YAML = {
     depends_on: {{ postgres: {{ condition: service_healthy }} }}
     volumes:
       - keycloak-data:/opt/keycloak/data
-      - ./keycloak-realms:/opt/keycloak/data/import:ro
     healthcheck:
       test: ['CMD-SHELL', 'exec 3<>/dev/tcp/localhost/8080 && printf "GET /health/ready HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n" >&3 && grep -q "200 OK" <&3']
       interval: 10s
@@ -1097,12 +1795,13 @@ INFRA_SERVICE_YAML = {
       POSTGRES_SEEDS: postgres
       DBNAME: temporal
       VISIBILITY_DBNAME: temporal_visibility
+      SKIP_DB_CREATE: 'true'
       DEFAULT_NAMESPACE: default
       DEFAULT_NAMESPACE_RETENTION: 24h
     ports: ['{temporal_host_port}:7233']
     depends_on: {{ postgres: {{ condition: service_healthy }} }}
     healthcheck:
-      test: ['CMD-SHELL', 'temporal operator cluster health || true']
+      test: ['CMD-SHELL', 'temporal operator cluster health']
       interval: 15s
       timeout: 5s
       retries: 10
@@ -1165,31 +1864,48 @@ MODULE_VOLUMES = {
     "elasticsearch": ["es-data"],
 }
 
-DOCKERFILE_NODE = """# Auto-generated by infra-init. Review if project has a non-standard build.
-FROM node:20-alpine AS deps
+def render_node_dockerfile(service: ServiceCandidate) -> str:
+    """Render a Debian-slim Node image from the audited service contract."""
+    audit = service.audit or ServiceAudit(name=service.name)
+    prisma_copy = "COPY prisma ./prisma\n" if audit.prisma else ""
+    prisma_generate = "npx prisma generate && " if audit.prisma else ""
+    runtime_prisma = "COPY --from=build /app/prisma ./prisma\n" if audit.prisma else ""
+    healthcheck = ""
+    if service.health_path:
+        healthcheck = (
+            "HEALTHCHECK --interval=15s --timeout=3s --start-period=30s --retries=3 \\\n"
+            f"  CMD curl -fsS http://localhost:{service.container_port}{service.health_path} || exit 1\n"
+        )
+    start_script = service.start_script or "prod"
+    build_script = service.build_script or "build"
+    return f"""# Auto-generated by infra-init from package.json + source contract.
+# Local development image; pin a digest before reuse outside local dev.
+FROM {service.base_image} AS deps
 WORKDIR /app
+RUN apt-get update && apt-get install -y --no-install-recommends openssl ca-certificates \\
+    && rm -rf /var/lib/apt/lists/*
 COPY package*.json ./
-RUN if [ -f package-lock.json ]; then npm ci; else npm install; fi
+{prisma_copy}RUN if [ -f package-lock.json ]; then npm ci; else npm install; fi
 
-FROM node:20-alpine AS build
+FROM {service.base_image} AS build
 WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
-RUN npm run build
+RUN {prisma_generate}npm run {build_script}
 
-FROM node:20-alpine AS runtime
+FROM {service.base_image} AS runtime
 WORKDIR /app
 ENV NODE_ENV=production
-RUN apk add --no-cache curl tini
+RUN apt-get update && apt-get install -y --no-install-recommends \\
+      openssl ca-certificates curl tini \\
+    && rm -rf /var/lib/apt/lists/*
 COPY --from=deps /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist
-COPY package*.json ./
-EXPOSE {port}
-HEALTHCHECK --interval=15s --timeout=3s --start-period=30s --retries=3 \\
-  CMD curl -fsS http://localhost:{port}/health || exit 1
-ENTRYPOINT ["/sbin/tini", "--"]
+{runtime_prisma}COPY package*.json ./
+EXPOSE {service.container_port}
+{healthcheck}ENTRYPOINT ["/usr/bin/tini", "--"]
 USER node
-CMD ["node", "dist/main.js"]
+CMD ["npm", "run", "{start_script}"]
 """
 
 
@@ -1222,10 +1938,13 @@ volumes:
     header += "".join(f"  {v}:\n" for v in vols) or "  {}\n"
     header += "\nservices:\n"
     postgres_service_env = "".join(
-        f"      {_service_db_password_key(s.name)}: "
-        f"'${{{_service_db_password_key(s.name)}:?set {_service_db_password_key(s.name)} in infra/.env}}'\n"
-        for s in plan.services
-        if "postgres" in s.detected_infra
+        f"      {password_env}: "
+        f"'${{{password_env}:?set {password_env} in infra/.env}}'\n"
+        for password_env in sorted({
+            s.db_password_env or _service_db_password_key(s.name)
+            for s in plan.services
+            if "postgres" in s.detected_infra
+        })
     )
     postgres_module_env = ""
     if "keycloak" in plan.infra_modules:
@@ -1247,6 +1966,73 @@ volumes:
             postgres_module_env=postgres_module_env,
             **_infra_template_values(plan),
         )
+    if "postgres" in plan.infra_modules:
+        body += f"""  postgres-provision:
+    image: postgres:16-alpine
+    profiles: [provision]
+    restart: 'no'
+    entrypoint: [bash, /provision/00-multi-db.sh]
+    environment:
+      PGHOST: postgres
+      PGPORT: '5432'
+      PGUSER: postgres
+      PGPASSWORD: '${{POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in infra/.env}}'
+{postgres_service_env}{postgres_module_env}    volumes:
+      - ./pg-init:/provision:ro
+    depends_on:
+      postgres: {{ condition: service_healthy }}
+    networks: [{plan.network_name}]
+
+"""
+    if (
+        "keycloak" in plan.infra_modules
+        and plan.keycloak_spec.get("mode") == "generated-local"
+    ):
+        secret_keys = sorted({
+            client["secret_env"]
+            for realm in plan.keycloak_spec.get("realms", [])
+            for client in realm.get("clients", [])
+            if client.get("kind") == "service-account" and client.get("secret_env")
+        }.union({
+            user["password_env"]
+            for user in plan.keycloak_spec.get("seed_users", [])
+            if user.get("password_env")
+        }))
+        client_env = "".join(
+            f"      {key}: '${{{key}:?set {key} in infra/.env}}'\n"
+            for key in secret_keys
+        )
+        body += f"""  keycloak-provision:
+    image: python:3.12-alpine
+    profiles: [provision]
+    restart: 'no'
+    command: [python, /provision/keycloak.py]
+    environment:
+      KEYCLOAK_ADMIN: admin
+      KEYCLOAK_ADMIN_PASSWORD: '${{KEYCLOAK_ADMIN_PASSWORD:?set KEYCLOAK_ADMIN_PASSWORD in infra/.env}}'
+      KEYCLOAK_BASE_URL: http://keycloak:8080
+{client_env}    volumes:
+      - ./provision:/provision:ro
+      - ./contracts:/contracts:ro
+    depends_on:
+      keycloak: {{ condition: service_healthy }}
+    networks: [{plan.network_name}]
+
+"""
+    if "kafka" in plan.infra_modules:
+        body += f"""  kafka-provision:
+    image: docker.redpanda.com/redpandadata/redpanda:v24.2.4
+    profiles: [provision]
+    restart: 'no'
+    entrypoint: [/bin/bash, /provision/kafka.sh]
+    volumes:
+      - ./provision:/provision:ro
+      - ./contracts:/contracts:ro
+    depends_on:
+      redpanda: {{ condition: service_healthy }}
+    networks: [{plan.network_name}]
+
+"""
     return header + body
 
 
@@ -1270,11 +2056,30 @@ services:
         env_lines = _env_for_service(s, plan)
         env_block = "".join(f"      {k}: {_yaml_quote(v)}\n" for k, v in env_lines)
         depends_on = _depends_on(plan)
+        image = (
+            f"{_normalize_image_component(plan.project_name, 'project')}/"
+            f"{_normalize_image_component(s.name)}:local"
+        )
+        if s.migration_mode == "auto":
+            migration_depends = _depends_on(plan)
+            body += f"""  {s.name}-migrate:
+    image: {image}
+    profiles: [migrate]
+    restart: 'no'
+    command: [npx, prisma, migrate, deploy]
+    environment:
+      NODE_ENV: staging
+      PORT: '{s.container_port}'
+{env_block}    depends_on:
+{migration_depends}
+    networks: [{plan.network_name}]
+
+"""
         body += f"""  {s.name}:
     build:
       context: ../{s.name}
       dockerfile: {df_path}
-    image: {_normalize_image_component(plan.project_name, 'project')}/{_normalize_image_component(s.name)}:local
+    image: {image}
     restart: unless-stopped
     environment:
       NODE_ENV: staging
@@ -1295,36 +2100,108 @@ def _yaml_quote(v: str) -> str:
     return v
 
 
-def _env_for_service(s: ServiceCandidate, plan: InitPlan) -> List[Tuple[str, str]]:
-    env: List[Tuple[str, str]] = []
-    if "postgres" in s.detected_infra and "postgres" in plan.infra_modules:
-        password_key = _service_db_password_key(s.name)
-        password_ref = f"${{{password_key}:?set {password_key} in infra/.env}}"
-        database_url = (
-            f"postgresql://{s.name}:"
-            f"{password_ref}"
-            f"@postgres:5432/{s.name}"
+def _service_alias(service_name: str) -> str:
+    alias = re.sub(r"[^A-Za-z0-9]+", "_", service_name).strip("_").upper()
+    return alias[2:] if alias.startswith("D_") else alias
+
+
+def _infer_service_ref(
+    key: str,
+    source: ServiceCandidate,
+    services: List[ServiceCandidate],
+) -> Optional[ServiceCandidate]:
+    explicit = source.service_refs.get(key)
+    if explicit:
+        return next((item for item in services if item.name == explicit), None)
+    matches = [
+        item
+        for item in services
+        if item.name != source.name and _service_alias(item.name) in key
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _rewrite_http_endpoint(value: str, host: str, port: int) -> str:
+    match = re.match(r"^(https?://)(?:[^/@]+@)?[^/:?#]+(?::\d+)?(.*)$", value)
+    if match:
+        return f"{match.group(1)}{host}:{port}{match.group(2)}"
+    return f"http://{host}:{port}"
+
+
+def _rewrite_contract_value(
+    service: ServiceCandidate,
+    plan: InitPlan,
+    key: str,
+    value: str,
+) -> str:
+    upper = key.upper()
+    modules = set(plan.infra_modules)
+    if upper == "DATABASE_URL" and "postgres" in modules:
+        password_key = service.db_password_env or _service_db_password_key(service.name)
+        encoded_key = _urlencoded_db_password_key(password_key)
+        password_ref = (
+            f"${{{encoded_key}:?run infra-up to derive {encoded_key} from {password_key}}}"
         )
-        env.append(("DATABASE_URL", database_url))
-    if "redis" in s.detected_infra and "redis" in plan.infra_modules:
-        env.append(("REDIS_URL", "redis://redis:6379"))
-    if "kafka" in s.detected_infra and "kafka" in plan.infra_modules:
-        env.append(("KAFKA_BROKERS", "redpanda:29092"))
-        env.append(("KAFKA_CLIENT_ID", s.name))
-    if "keycloak" in s.detected_infra and "keycloak" in plan.infra_modules:
-        env.append(("KEYCLOAK_URL", "http://keycloak:8080"))
-    if "temporal" in s.detected_infra and "temporal" in plan.infra_modules:
-        env.append(("TEMPORAL_ADDRESS", "temporal:7233"))
-    if "minio" in s.detected_infra and "minio" in plan.infra_modules:
-        env.append(("S3_ENDPOINT", "http://minio:9000"))
-        env.append(("S3_ACCESS_KEY_ID", "${MINIO_ROOT_USER:?set MINIO_ROOT_USER in infra/.env}"))
-        env.append(("S3_SECRET_ACCESS_KEY", "${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD in infra/.env}"))
-    if "elasticsearch" in s.detected_infra and "elasticsearch" in plan.infra_modules:
-        env.append(("ELASTICSEARCH_URL", "http://elasticsearch:9200"))
-    return env
+        role = service.db_role or service.name
+        database = service.db_name or service.name
+        userinfo = f"{role}:{password_ref}"
+        return "postgresql://" + userinfo + f"@postgres:5432/{database}"
+    if upper == "REDIS_HOST" and "redis" in modules:
+        return "redis"
+    if upper == "REDIS_PORT" and "redis" in modules:
+        return "6379"
+    if "REDIS" in upper and ("URL" in upper or value.startswith(("redis://", "rediss://"))) and "redis" in modules:
+        scheme = "rediss" if value.startswith("rediss://") else "redis"
+        return f"{scheme}://redis:6379"
+    if upper in {"KAFKA_BROKERS", "KAFKA_BOOTSTRAP_SERVERS"} and "kafka" in modules:
+        return "redpanda:29092"
+    if upper == "KAFKA_HOST" and "kafka" in modules:
+        return "redpanda"
+    if upper == "KAFKA_PORT" and "kafka" in modules:
+        return "29092"
+    if upper.startswith("KEYCLOAK_") and (
+        value.startswith(("http://", "https://")) or upper.endswith(("URL", "URI"))
+    ) and "keycloak" in modules:
+        return _rewrite_http_endpoint(value, "keycloak", 8080)
+    if upper in {"TEMPORAL_ADDRESS", "TEMPORAL_HOST_PORT"} and "temporal" in modules:
+        return "temporal:7233"
+    if upper == "TEMPORAL_HOST" and "temporal" in modules:
+        return "temporal"
+    if upper == "TEMPORAL_PORT" and "temporal" in modules:
+        return "7233"
+    if upper in {"S3_ENDPOINT", "S3_ENDPOINT_URL", "MINIO_ENDPOINT"} and "minio" in modules:
+        return _rewrite_http_endpoint(value, "minio", 9000)
+    if "ELASTIC" in upper and "URL" in upper and "elasticsearch" in modules:
+        return _rewrite_http_endpoint(value, "elasticsearch", 9200)
+    target = _infer_service_ref(key, service, plan.services)
+    if target and (value.startswith(("http://", "https://")) or upper.endswith(("URL", "URI"))):
+        return _rewrite_http_endpoint(value, target.name, target.container_port)
+    return value
 
 
-def _depends_on(plan: InitPlan) -> str:
+def _env_for_service(s: ServiceCandidate, plan: InitPlan) -> List[Tuple[str, str]]:
+    audit = s.audit or ServiceAudit(name=s.name)
+    env: Dict[str, str] = {}
+    values = dict(s.env_values)
+    if audit.prisma and "postgres" in plan.infra_modules:
+        values.setdefault("DATABASE_URL", "")
+    for key, raw in sorted(values.items()):
+        if key in {"NODE_ENV", "PORT"}:
+            continue
+        evidence = audit.env.get(key)
+        if key in s.secret_keys or (evidence.secret if evidence else is_secret_key(key)):
+            env[key] = f"${{{key}:?set {key} in infra/.env}}"
+            continue
+        if raw is None:
+            continue
+        env[key] = _rewrite_contract_value(s, plan, key, raw)
+    return sorted(env.items())
+
+
+def _depends_on(
+    plan: InitPlan,
+    migration_service: Optional[ServiceCandidate] = None,
+) -> str:
     conds = []
     for m in plan.infra_modules:
         host = MODULE_HOST[m]
@@ -1332,53 +2209,66 @@ def _depends_on(plan: InitPlan) -> str:
             conds.append(f"      {host}:\n        condition: service_started")
         elif m in ("postgres", "redis", "kafka", "keycloak", "minio", "elasticsearch"):
             conds.append(f"      {host}:\n        condition: service_healthy")
+    if migration_service is not None:
+        conds.append(
+            f"      {migration_service.name}-migrate:\n"
+            "        condition: service_completed_successfully"
+        )
     return "\n".join(conds) if conds else "      {}"
 
 
 def render_env_example(plan: InitPlan) -> str:
-    keycloak_host_port = _infra_template_values(plan)["keycloak_host_port"]
     lines = [
-        "# Copy to `.env` (KHÔNG commit) và điền secret thật.",
-        "# Các biến ${VAR:?...} trong docker-compose.apps.yml sẽ đọc từ file này.",
+        "# Local-development secrets. Copy to `.env`; never commit that file.",
+        "# GENERATE_ME values are local-owned and bootstrap mints them safely.",
+        "# REPLACE_ME values are external credentials and must be supplied explicitly.",
         "",
     ]
+    secrets: Dict[str, bool] = {}
+
+    def add_secret(key: str, generated: bool) -> None:
+        # A key shared with a known local provisioner is safe to mint even if
+        # the app contract also references it.
+        secrets[key] = secrets.get(key, False) or generated
+
     if "postgres" in plan.infra_modules:
-        lines += [
-            "POSTGRES_PASSWORD=REPLACE_ME_POSTGRES_PASSWORD",
-            *(
-                f"{_service_db_password_key(s.name)}=REPLACE_ME_{_service_db_password_key(s.name)}"
-                for s in plan.services
-                if "postgres" in s.detected_infra
-            ),
-            "",
-        ]
+        add_secret("POSTGRES_PASSWORD", True)
+        for service in plan.services:
+            if "postgres" in service.detected_infra:
+                add_secret(
+                    service.db_password_env or _service_db_password_key(service.name), True
+                )
     if "keycloak" in plan.infra_modules:
-        lines += [
-            "KEYCLOAK_ADMIN_PASSWORD=REPLACE_ME_KEYCLOAK_ADMIN_PASSWORD",
-            "KEYCLOAK_DB_PASSWORD=REPLACE_ME_KEYCLOAK_DB_PASSWORD",
-            "",
-            "# Mint client secret sau khi Keycloak up (thay dp-p2 = realm của bạn):",
-            "#   set -a; . ./.env; set +a",
-            f"#   TOKEN=$(curl -s -X POST http://localhost:{keycloak_host_port}/realms/master/protocol/openid-connect/token \\",
-            "#     -d client_id=admin-cli -d username=admin -d password=\"$KEYCLOAK_ADMIN_PASSWORD\" -d grant_type=password \\",
-            "#     | python3 -c 'import json,sys;print(json.load(sys.stdin)[\"access_token\"])')",
-            "#   CID=$(curl -s -H \"Authorization: Bearer $TOKEN\" \\",
-            f"#     'http://localhost:{keycloak_host_port}/admin/realms/<REALM>/clients?clientId=<CLIENT>' \\",
-            "#     | python3 -c 'import json,sys;print(json.load(sys.stdin)[0][\"id\"])')",
-            "#   curl -s -X POST -H \"Authorization: Bearer $TOKEN\" \\",
-            f"#     \"http://localhost:{keycloak_host_port}/admin/realms/<REALM>/clients/$CID/client-secret\"",
-            "",
-            "# EXAMPLE_ADMIN_SECRET=REPLACE_ME",
-            "",
-        ]
+        add_secret("KEYCLOAK_ADMIN_PASSWORD", True)
+        add_secret("KEYCLOAK_DB_PASSWORD", True)
+        for realm in plan.keycloak_spec.get("realms", []):
+            for client in realm.get("clients", []):
+                if client.get("secret_env"):
+                    add_secret(
+                        client["secret_env"],
+                        plan.keycloak_spec.get("mode") == "generated-local",
+                    )
+        for user in plan.keycloak_spec.get("seed_users", []):
+            if user.get("password_env"):
+                add_secret(
+                    user["password_env"],
+                    plan.keycloak_spec.get("mode") == "generated-local",
+                )
     if "temporal" in plan.infra_modules:
-        lines += ["TEMPORAL_DB_PASSWORD=REPLACE_ME_TEMPORAL_DB_PASSWORD", ""]
+        add_secret("TEMPORAL_DB_PASSWORD", True)
     if "minio" in plan.infra_modules:
-        lines += [
-            "MINIO_ROOT_USER=REPLACE_ME_MINIO_ROOT_USER",
-            "MINIO_ROOT_PASSWORD=REPLACE_ME_MINIO_ROOT_PASSWORD",
-            "",
-        ]
+        add_secret("MINIO_ROOT_USER", True)
+        add_secret("MINIO_ROOT_PASSWORD", True)
+    for service in plan.services:
+        audit = service.audit or ServiceAudit(name=service.name)
+        for key in service.env_values:
+            evidence = audit.env.get(key)
+            if key in service.secret_keys or (evidence.secret if evidence else is_secret_key(key)):
+                add_secret(key, key in service.generated_secret_keys)
+    for key, generated in secrets.items():
+        marker = "GENERATE_ME" if generated else "REPLACE_ME"
+        lines.append(f"{key}={marker}_{key}")
+    lines.append("")
     return "\n".join(lines)
 
 
@@ -1387,12 +2277,33 @@ def _service_db_password_key(service_name: str) -> str:
     return f"{normalized}_DB_PASSWORD"
 
 
+def _urlencoded_db_password_key(password_key: str) -> str:
+    return f"{password_key}_URLENCODED"
+
+
 def _db_secret_key_collisions(services: List[ServiceCandidate]) -> Dict[str, List[str]]:
-    owners: Dict[str, List[str]] = {}
+    owners: Dict[str, List[ServiceCandidate]] = {}
     for service in services:
         if "postgres" in service.detected_infra:
-            owners.setdefault(_service_db_password_key(service.name), []).append(service.name)
-    return {secret_key: names for secret_key, names in owners.items() if len(names) > 1}
+            key = service.db_password_env or _service_db_password_key(service.name)
+            owners.setdefault(key, []).append(service)
+    return {
+        secret_key: [service.name for service in candidates]
+        for secret_key, candidates in owners.items()
+        if len({(service.db_role, service.db_name) for service in candidates}) > 1
+    }
+
+
+def _shared_db_conflicts(services: List[ServiceCandidate]) -> Dict[str, List[str]]:
+    databases: Dict[str, List[ServiceCandidate]] = {}
+    for service in services:
+        if "postgres" in service.detected_infra:
+            databases.setdefault(service.db_name or service.name, []).append(service)
+    return {
+        database: [service.name for service in candidates]
+        for database, candidates in databases.items()
+        if len({(service.db_role, service.db_password_env) for service in candidates}) > 1
+    }
 
 
 def _sql_identifier(value: str) -> str:
@@ -1400,33 +2311,401 @@ def _sql_identifier(value: str) -> str:
 
 
 def render_pg_init(plan: InitPlan) -> str:
-    dbs = [(s.name, _service_db_password_key(s.name))
-           for s in plan.services if "postgres" in s.detected_infra]
-    body = "#!/bin/bash\n# Auto-generated. Creates one DB + role per service.\nset -e\n\n"
-    for db, password_key in dbs:
-        identifier = _sql_identifier(db)
-        body += f': "${{{password_key}:?set {password_key}}}"\n'
-        body += (f'psql -v ON_ERROR_STOP=1 --username postgres '
-                 f'--set=role_password="${{{password_key}}}" <<-EOSQL\n')
-        body += f'    CREATE USER {identifier} WITH PASSWORD :\'role_password\';\n'
-        body += f'    CREATE DATABASE {identifier} OWNER {identifier};\n'
-        body += f'    GRANT ALL ON DATABASE {identifier} TO {identifier};\n'
-        body += "EOSQL\n\n"
-    # Extra DBs for keycloak/temporal
+    body = r"""#!/usr/bin/env bash
+# Auto-generated local-dev reconciler. Safe on both a fresh and an existing volume.
+set -euo pipefail
+
+ensure_role_and_db() {
+  local role="$1" password_var="$2" database="$3"
+  local password="${!password_var:?set $password_var}"
+  ROLE_PASSWORD="$password" psql -v ON_ERROR_STOP=1 --dbname postgres \
+    --set=role_name="$role" <<'EOSQL'
+\getenv role_password ROLE_PASSWORD
+SELECT format('CREATE ROLE %I LOGIN PASSWORD %L', :'role_name', :'role_password')
+WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = :'role_name') \gexec
+SELECT format('ALTER ROLE %I WITH LOGIN PASSWORD %L', :'role_name', :'role_password') \gexec
+EOSQL
+  if ! psql -v ON_ERROR_STOP=1 --dbname postgres --tuples-only --no-align \
+      --set=db_name="$database" \
+      --command="SELECT 1 FROM pg_database WHERE datname = :'db_name'" | grep -qx 1; then
+    createdb --owner="$role" "$database"
+  fi
+  psql -v ON_ERROR_STOP=1 --dbname postgres \
+    --set=db_name="$database" --set=role_name="$role" <<'EOSQL'
+SELECT format('ALTER DATABASE %I OWNER TO %I', :'db_name', :'role_name') \gexec
+EOSQL
+}
+
+ensure_schema() {
+  local database="$1" schema="$2" role="$3"
+  psql -v ON_ERROR_STOP=1 --dbname "$database" \
+    --set=schema_name="$schema" --set=role_name="$role" <<'EOSQL'
+SELECT format('CREATE SCHEMA IF NOT EXISTS %I AUTHORIZATION %I', :'schema_name', :'role_name') \gexec
+SELECT format('ALTER SCHEMA %I OWNER TO %I', :'schema_name', :'role_name') \gexec
+EOSQL
+}
+
+"""
+    for service in plan.services:
+        if "postgres" not in service.detected_infra:
+            continue
+        database = service.db_name or service.name
+        role = service.db_role or service.name
+        password_key = service.db_password_env or _service_db_password_key(service.name)
+        body += (
+            f'ensure_role_and_db {shlex.quote(role)} {password_key} '
+            f'{shlex.quote(database)}\n'
+        )
+        for schema in service.db_schemas:
+            body += (
+                f'ensure_schema {shlex.quote(database)} {shlex.quote(schema)} '
+                f'{shlex.quote(role)}\n'
+            )
+        body += "\n"
     if "keycloak" in plan.infra_modules:
-        body += ': "${KEYCLOAK_DB_PASSWORD:?set KEYCLOAK_DB_PASSWORD}"\n'
-        body += ('psql -v ON_ERROR_STOP=1 --username postgres '
-                 '--set=role_password="$KEYCLOAK_DB_PASSWORD" <<-EOSQL\n')
-        body += "    CREATE USER keycloak WITH PASSWORD :'role_password';\n"
-        body += "    CREATE DATABASE keycloak OWNER keycloak;\nEOSQL\n\n"
+        body += "ensure_role_and_db keycloak KEYCLOAK_DB_PASSWORD keycloak\n"
     if "temporal" in plan.infra_modules:
-        body += ': "${TEMPORAL_DB_PASSWORD:?set TEMPORAL_DB_PASSWORD}"\n'
-        body += ('psql -v ON_ERROR_STOP=1 --username postgres '
-                 '--set=role_password="$TEMPORAL_DB_PASSWORD" <<-EOSQL\n')
-        body += "    CREATE USER temporal WITH PASSWORD :'role_password';\n"
-        body += "    CREATE DATABASE temporal OWNER temporal;\n"
-        body += "    CREATE DATABASE temporal_visibility OWNER temporal;\nEOSQL\n"
+        body += "ensure_role_and_db temporal TEMPORAL_DB_PASSWORD temporal\n"
+        body += "ensure_role_and_db temporal TEMPORAL_DB_PASSWORD temporal_visibility\n"
     return body
+
+
+def postgres_contract(plan: InitPlan) -> Dict[str, Any]:
+    databases: List[Dict[str, Any]] = []
+    for service in plan.services:
+        if "postgres" in service.detected_infra:
+            databases.append({
+                "name": service.db_name or service.name,
+                "owner": service.db_role or service.name,
+                "password_env": service.db_password_env or _service_db_password_key(service.name),
+                "schemas": list(service.db_schemas),
+            })
+    if "keycloak" in plan.infra_modules:
+        databases.append({
+            "name": "keycloak", "owner": "keycloak",
+            "password_env": "KEYCLOAK_DB_PASSWORD", "schemas": [],
+        })
+    if "temporal" in plan.infra_modules:
+        for database in ("temporal", "temporal_visibility"):
+            databases.append({
+                "name": database, "owner": "temporal",
+                "password_env": "TEMPORAL_DB_PASSWORD", "schemas": [],
+            })
+    return {"databases": databases}
+
+
+def env_contract(plan: InitPlan) -> Dict[str, Any]:
+    services: Dict[str, Any] = {}
+    for service in plan.services:
+        audit = service.audit or ServiceAudit(name=service.name)
+        rendered = dict(_env_for_service(service, plan))
+        rendered.update({"NODE_ENV": "staging", "PORT": str(service.container_port)})
+        secret_checks: List[Dict[str, str]] = []
+        for key, value in rendered.items():
+            references = re.findall(r"\$\{([A-Z][A-Z0-9_]*):\?", value)
+            for secret_env in references:
+                secret_checks.append({
+                    "secret_env": secret_env,
+                    "container_key": key,
+                    "mode": "url_password" if key == "DATABASE_URL" else "direct",
+                })
+        services[service.name] = {
+            "required_keys": sorted(rendered),
+            "secret_keys": sorted(
+                key
+                for key in rendered
+                if key in service.secret_keys
+                or (audit.env.get(key).secret if audit.env.get(key) else is_secret_key(key))
+            ),
+            "expected": {
+                key: item.expected
+                for key, item in audit.env.items()
+                if item.expected and key in rendered
+            },
+            "health_path": service.health_path,
+            "secret_checks": secret_checks,
+            "host_port": service.host_port,
+            "container_port": service.container_port,
+            "contract_sources": {
+                key: sorted(item.sources) for key, item in sorted(audit.env.items())
+            },
+        }
+    return {
+        "services": services,
+        "platform_allowlist": [
+            "HOME", "HOSTNAME", "PATH", "PWD", "SHLVL",
+            "NPM_CONFIG_*", "NODE_VERSION", "YARN_VERSION",
+        ],
+    }
+
+
+def render_keycloak_provisioner() -> str:
+    return r'''#!/usr/bin/env python3
+"""Idempotently reconcile generated local-dev Keycloak realms."""
+import json
+import os
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+BASE = os.environ.get("KEYCLOAK_BASE_URL", "http://keycloak:8080").rstrip("/")
+CONTRACT_PATH = os.environ.get("KEYCLOAK_CONTRACT_PATH", "/contracts/keycloak.json")
+with open(CONTRACT_PATH, encoding="utf-8") as contract_file:
+    CONTRACT = json.load(contract_file)
+
+
+def raw_request(path, method="GET", payload=None, form=None, token=None, allow=()):
+    data = None
+    headers = {}
+    if payload is not None:
+        data = json.dumps(payload).encode()
+        headers["Content-Type"] = "application/json"
+    if form is not None:
+        data = urllib.parse.urlencode(form).encode()
+        headers["Content-Type"] = "application/x-www-form-urlencoded"
+    if token:
+        headers["Authorization"] = "Bearer " + token
+    request = urllib.request.Request(BASE + path, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            body = response.read()
+            return response.status, json.loads(body) if body else None
+    except urllib.error.HTTPError as exc:
+        if exc.code in allow:
+            return exc.code, None
+        body = exc.read().decode(errors="replace")
+        raise RuntimeError(f"Keycloak {method} {path} failed HTTP {exc.code}: {body[:500]}")
+
+
+_, token_payload = raw_request(
+    "/realms/master/protocol/openid-connect/token",
+    method="POST",
+    form={
+        "client_id": "admin-cli",
+        "username": os.environ["KEYCLOAK_ADMIN"],
+        "password": os.environ["KEYCLOAK_ADMIN_PASSWORD"],
+        "grant_type": "password",
+    },
+)
+TOKEN = token_payload["access_token"]
+
+
+def request(path, method="GET", payload=None, allow=()):
+    return raw_request(path, method=method, payload=payload, token=TOKEN, allow=allow)
+
+
+def ensure_realm(name):
+    quoted = urllib.parse.quote(name, safe="")
+    status, _ = request(f"/admin/realms/{quoted}", allow=(404,))
+    if status == 404:
+        request("/admin/realms", method="POST", payload={"realm": name, "enabled": True})
+        print(f"created realm {name}")
+    else:
+        request(f"/admin/realms/{quoted}", method="PUT", payload={"realm": name, "enabled": True})
+        print(f"reconciled realm {name}")
+
+
+def ensure_realm_role(realm, role):
+    rp = urllib.parse.quote(realm, safe="")
+    rolep = urllib.parse.quote(role, safe="")
+    status, _ = request(f"/admin/realms/{rp}/roles/{rolep}", allow=(404,))
+    if status == 404:
+        request(f"/admin/realms/{rp}/roles", method="POST", payload={"name": role})
+
+
+def find_client(realm, client_id):
+    rp = urllib.parse.quote(realm, safe="")
+    query = urllib.parse.urlencode({"clientId": client_id})
+    _, clients = request(f"/admin/realms/{rp}/clients?{query}")
+    return clients[0] if clients else None
+
+
+def ensure_client(realm, spec):
+    rp = urllib.parse.quote(realm, safe="")
+    client_id = spec["client_id"]
+    service_account = spec["kind"] == "service-account"
+    representation = {
+        "clientId": client_id,
+        "enabled": True,
+        "publicClient": not service_account,
+        "standardFlowEnabled": not service_account,
+        "directAccessGrantsEnabled": False,
+        "serviceAccountsEnabled": service_account,
+    }
+    if not service_account:
+        representation.update({"redirectUris": ["*"], "webOrigins": ["*"]})
+    else:
+        representation["secret"] = os.environ[spec["secret_env"]]
+    current = find_client(realm, client_id)
+    if current is None:
+        request(f"/admin/realms/{rp}/clients", method="POST", payload=representation)
+        current = find_client(realm, client_id)
+    else:
+        representation["id"] = current["id"]
+        request(
+            f"/admin/realms/{rp}/clients/{current['id']}",
+            method="PUT",
+            payload=representation,
+        )
+    for role in spec.get("roles", []):
+        rolep = urllib.parse.quote(role, safe="")
+        status, _ = request(
+            f"/admin/realms/{rp}/clients/{current['id']}/roles/{rolep}",
+            allow=(404,),
+        )
+        if status == 404:
+            request(
+                f"/admin/realms/{rp}/clients/{current['id']}/roles",
+                method="POST",
+                payload={"name": role},
+            )
+    if service_account:
+        grant_local_admin(realm, current["id"])
+        _, result = raw_request(
+            f"/realms/{rp}/protocol/openid-connect/token",
+            method="POST",
+            form={
+                "client_id": client_id,
+                "client_secret": os.environ[spec["secret_env"]],
+                "grant_type": "client_credentials",
+            },
+        )
+        if not result or "access_token" not in result:
+            raise RuntimeError(f"client_credentials smoke check failed for {realm}/{client_id}")
+    print(f"reconciled client {realm}/{client_id}")
+
+
+def grant_local_admin(realm, client_uuid):
+    rp = urllib.parse.quote(realm, safe="")
+    _, user = request(f"/admin/realms/{rp}/clients/{client_uuid}/service-account-user")
+    _, management = request(
+        f"/admin/realms/{rp}/clients?"
+        + urllib.parse.urlencode({"clientId": "realm-management"})
+    )
+    management_uuid = management[0]["id"]
+    _, role = request(
+        f"/admin/realms/{rp}/clients/{management_uuid}/roles/realm-admin"
+    )
+    request(
+        f"/admin/realms/{rp}/users/{user['id']}/role-mappings/clients/{management_uuid}",
+        method="POST",
+        payload=[role],
+    )
+
+
+def ensure_user(spec):
+    realm = spec["realm"]
+    rp = urllib.parse.quote(realm, safe="")
+    query = urllib.parse.urlencode({"username": spec["username"], "exact": "true"})
+    _, users = request(f"/admin/realms/{rp}/users?{query}")
+    if users:
+        user_id = users[0]["id"]
+    else:
+        request(
+            f"/admin/realms/{rp}/users",
+            method="POST",
+            payload={"username": spec["username"], "enabled": True},
+        )
+        _, users = request(f"/admin/realms/{rp}/users?{query}")
+        user_id = users[0]["id"]
+    request(
+        f"/admin/realms/{rp}/users/{user_id}/reset-password",
+        method="PUT",
+        payload={
+            "type": "password",
+            "temporary": False,
+            "value": os.environ[spec["password_env"]],
+        },
+    )
+    roles = []
+    for role_name in spec.get("realm_roles", []):
+        _, role = request(
+            f"/admin/realms/{rp}/roles/{urllib.parse.quote(role_name, safe='')}"
+        )
+        roles.append(role)
+    if roles:
+        request(
+            f"/admin/realms/{rp}/users/{user_id}/role-mappings/realm",
+            method="POST",
+            payload=roles,
+        )
+    print(f"reconciled seed user {realm}/{spec['username']}")
+
+
+if CONTRACT.get("mode") != "generated-local":
+    print("official Keycloak contract selected; generated reconciliation skipped")
+    sys.exit(0)
+for realm in CONTRACT.get("realms", []):
+    ensure_realm(realm["name"])
+    for role in realm.get("roles", []):
+        ensure_realm_role(realm["name"], role)
+    for client in realm.get("clients", []):
+        ensure_client(realm["name"], client)
+for user in CONTRACT.get("seed_users", []):
+    ensure_user(user)
+print("Keycloak local-dev contract verified")
+'''
+
+
+def render_kafka_provisioner(plan: InitPlan) -> str:
+    lines = [
+        "#!/usr/bin/env bash",
+        "# Auto-generated local-dev Kafka topic reconciler.",
+        "set -euo pipefail",
+        "BROKERS=redpanda:29092",
+        "",
+        "topic_shape() {",
+        "  awk '$1 == \"NAME\" && $2 == \"PARTITIONS\" && $3 == \"REPLICAS\" { getline; print $2, $3; exit }'",
+        "}",
+        "",
+        "reconcile_topic() {",
+        "  local name=\"$1\" wanted_partitions=\"$2\" wanted_replicas=\"$3\"",
+        "  local description current_partitions current_replicas delta",
+        "  if ! description=\"$(rpk -X brokers=$BROKERS topic describe \"$name\" 2>/dev/null)\"; then",
+        "    rpk -X brokers=$BROKERS topic create \"$name\" --partitions \"$wanted_partitions\" --replicas \"$wanted_replicas\"",
+        "    description=\"$(rpk -X brokers=$BROKERS topic describe \"$name\")\"",
+        "  fi",
+        "  read -r current_partitions current_replicas < <(printf '%s\\n' \"$description\" | topic_shape)",
+        "  [[ \"$current_partitions\" =~ ^[0-9]+$ && \"$current_replicas\" =~ ^[0-9]+$ ]] || {",
+        "    echo \"error: cannot parse topic shape for $name\" >&2; exit 1;",
+        "  }",
+        "  if (( current_partitions < wanted_partitions )); then",
+        "    delta=$((wanted_partitions - current_partitions))",
+        "    rpk -X brokers=$BROKERS topic add-partitions \"$name\" --num \"$delta\"",
+        "    current_partitions=$wanted_partitions",
+        "  fi",
+        "  if (( current_partitions != wanted_partitions )); then",
+        "    echo \"error: topic $name has $current_partitions partitions; reviewed contract requires $wanted_partitions (partition count cannot be reduced safely)\" >&2",
+        "    exit 1",
+        "  fi",
+        "  if (( current_replicas != wanted_replicas )); then",
+        "    echo \"error: topic $name has replication $current_replicas; reviewed local single-broker contract requires $wanted_replicas\" >&2",
+        "    exit 1",
+        "  fi",
+        "}",
+    ]
+    for topic in plan.kafka_spec.get("topics", []):
+        name = shlex.quote(topic["name"])
+        lines.append(
+            f"reconcile_topic {name} {topic['partitions']} {topic['replication_factor']}"
+        )
+        for key, value in sorted(topic.get("config", {}).items()):
+            setting = shlex.quote(f"{key}={value}")
+            lines.append(
+                f"rpk -X brokers=$BROKERS topic alter-config {name} --set {setting}"
+            )
+        lines.append(f"rpk -X brokers=$BROKERS topic describe {name} >/dev/null")
+    if plan.kafka_spec.get("strict"):
+        lines.append(
+            "rpk -X brokers=$BROKERS cluster config set auto_create_topics_enabled false"
+        )
+    else:
+        lines.append(
+            "echo 'Kafka auto-create remains enabled: no complete reviewed topic contract.'"
+        )
+    lines.append("echo 'Kafka topic contract verified'")
+    return "\n".join(lines) + "\n"
 
 
 def render_readme(plan: InitPlan) -> str:
@@ -1449,15 +2728,19 @@ Auto-scaffolded by `scripts/infra-init.py`.
 ## Bring up
 
 ```bash
-cd infra
-docker compose -f docker-compose.infra.yml up -d
-# after Keycloak/Postgres healthy, mint secrets → .env
-docker compose -f docker-compose.infra.yml -f docker-compose.apps.yml up -d --build
+../scripts/bootstrap.sh --yes
 ```
 
+`infra-up.sh` starts base infra, reconciles live Postgres schemas, Keycloak
+realms/clients/roles and Kafka topics, runs Prisma migrations once, then starts apps.
+Bootstrap mints only `GENERATE_ME_*` local secrets and stops on any external
+`REPLACE_ME_*` credential that still needs an explicit value.
+The generated Keycloak permissions and wildcard redirect URIs are **local-dev only**.
+Select `keycloak.mode=official` in a reviewed init config when Security owns realms.
+
 Or use wrappers:
-- `../scripts/infra-up.sh` — up all (infra + apps)
-- `../scripts/infra-up.sh --infra-only` — just infra
+- `../scripts/infra-up.sh` — provision + migrate + up all
+- `../scripts/infra-up.sh --infra-only` — provision shared infra only
 - `../scripts/docker-apps-up.sh [service...]` — apps only, infra assumed healthy
 - `../scripts/infra-down.sh [--volumes]` — down; add `--volumes` to wipe data
 
@@ -1479,13 +2762,42 @@ Or use wrappers:
 ../scripts/sync-env-docker.py verify <service>       # if wired into scripts/
 # or from anywhere via skill: /sync-env-docker
 ```
+
+The verifier uses `infra/contracts/env.json`, which is the audited union of
+`.env.example`, source configuration calls, validation schema and Prisma env usage.
 """
 
 
 # ---------- Write ----------
 
+def _merge_preserved_env(previous: Path, example: Path, target: Path) -> None:
+    """Preserve existing credentials and append newly generated contract keys."""
+    old_lines = previous.read_text().splitlines()
+    known = {
+        match.group(1)
+        for line in old_lines
+        for match in [re.match(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=", line)]
+        if match
+    }
+    additions = []
+    for line in example.read_text().splitlines():
+        match = re.match(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=", line)
+        if match and match.group(1) not in known:
+            additions.append(line)
+            known.add(match.group(1))
+    merged = list(old_lines)
+    if additions:
+        if merged and merged[-1]:
+            merged.append("")
+        merged.append("# Added by regenerated docker-claude contract; review REPLACE_ME values.")
+        merged.extend(additions)
+    target.write_text("\n".join(merged) + "\n")
+    target.chmod(0o600)
+
+
 def write_plan(plan: InitPlan) -> None:
     infra_dir = plan.project_root / "infra"
+    preserved_env: Optional[Path] = None
     if infra_dir.exists() and not plan.force:
         print(f"\nerror: {infra_dir} already exists. Use --force to overwrite.")
         sys.exit(1)
@@ -1493,6 +2805,9 @@ def write_plan(plan: InitPlan) -> None:
         backup = plan.project_root / f"infra.backup.{_ts()}"
         print(f"backing up existing infra/ → {backup.name}/")
         shutil.move(str(infra_dir), str(backup))
+        candidate = backup / ".env"
+        if candidate.is_file():
+            preserved_env = candidate
 
     infra_dir.mkdir(parents=True)
     (infra_dir / "docker-compose.infra.yml").write_text(render_infra_yaml(plan))
@@ -1500,6 +2815,9 @@ def write_plan(plan: InitPlan) -> None:
     (infra_dir / ".env.example").write_text(render_env_example(plan))
     (infra_dir / ".gitignore").write_text(".env\n")
     (infra_dir / "README.md").write_text(render_readme(plan))
+    if preserved_env is not None:
+        _merge_preserved_env(preserved_env, infra_dir / ".env.example", infra_dir / ".env")
+        print("preserved existing infra/.env and appended newly required keys")
 
     if "postgres" in plan.infra_modules:
         pg = infra_dir / "pg-init"
@@ -1508,27 +2826,45 @@ def write_plan(plan: InitPlan) -> None:
         script.write_text(render_pg_init(plan))
         script.chmod(0o755)
 
+    contracts = infra_dir / "contracts"
+    contracts.mkdir()
+    (contracts / "env.json").write_text(
+        json.dumps(env_contract(plan), indent=2, sort_keys=True) + "\n"
+    )
+    (contracts / "postgres.json").write_text(
+        json.dumps(postgres_contract(plan), indent=2, sort_keys=True) + "\n"
+    )
+    (contracts / "keycloak.json").write_text(
+        json.dumps(plan.keycloak_spec, indent=2, sort_keys=True) + "\n"
+    )
+    (contracts / "kafka.json").write_text(
+        json.dumps(plan.kafka_spec, indent=2, sort_keys=True) + "\n"
+    )
+
+    provision = infra_dir / "provision"
+    provision.mkdir()
     if "keycloak" in plan.infra_modules:
-        kr = infra_dir / "keycloak-realms"
-        kr.mkdir()
-        (kr / "README.md").write_text(
-            "# Realm exports\n\nDrop realm JSON files here (e.g. `dp-p1-realm.json`).\n"
-            "`--import-realm` in docker-compose will auto-import on Keycloak start.\n"
-        )
+        keycloak_script = provision / "keycloak.py"
+        keycloak_script.write_text(render_keycloak_provisioner())
+        keycloak_script.chmod(0o755)
+    if "kafka" in plan.infra_modules:
+        kafka_script = provision / "kafka.sh"
+        kafka_script.write_text(render_kafka_provisioner(plan))
+        kafka_script.chmod(0o755)
 
     df_dir = infra_dir / "dockerfiles"
     df_dir.mkdir()
     for s in plan.services:
         if s.dockerfile_source == "generated" and s.language == "node":
             (df_dir / f"Dockerfile.{s.name}").write_text(
-                DOCKERFILE_NODE.format(port=s.container_port)
+                render_node_dockerfile(s)
             )
 
     print(f"\n✓ wrote {infra_dir}")
     print("next:")
     print(f"  cd {infra_dir.relative_to(Path.cwd()) if Path.cwd() in infra_dir.parents else infra_dir}")
-    print("  # edit .env (mint secrets)")
-    print("  docker compose -f docker-compose.infra.yml up -d")
+    print("  # copy .env.example to .env, then run the idempotent bootstrap flow")
+    print("  ../scripts/infra-up.sh --build")
 
 
 def _ts() -> str:

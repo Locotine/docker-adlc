@@ -66,6 +66,26 @@ Sau khi producer publish version mới, chạy trong từng project consumer:
 
 Lần `/reload-plugins` đầu kích hoạt version plugin mới trước khi chạy installer; lần thứ hai nạp lại các project skill vừa được đồng bộ. `install-project` ghi đè toàn bộ file do plugin quản lý bằng version vừa update. Các file khác trong `.claude/skills/` và `scripts/` không thuộc payload plugin vẫn được giữ nguyên.
 
+`install-project` cập nhật **generator/verifier/wrapper**, nhưng không tự ghi đè `infra/`
+đã sinh vì thư mục đó có thể chứa thay đổi và dữ liệu cấu hình của project. Để nhận
+template generator mới trong một project đã bootstrap, audit lại rồi regenerate có backup:
+
+```bash
+./scripts/infra-init.py --detect-json > /tmp/docker-plan.json
+# review các uncertainties/Grill Me và lưu thành /tmp/docker-plan.reviewed.json
+./scripts/infra-init.py --config /tmp/docker-plan.reviewed.json --force
+# infra-init tự giữ credential cũ trong infra/.env và append key mới.
+# Điền mọi REPLACE_ME_* (credential ngoài hệ thống) trước khi tiếp tục.
+./scripts/bootstrap.sh --yes
+```
+
+`--force` chuyển bản cũ sang `infra.backup.<timestamp>/`, không xóa, rồi merge giá trị
+`infra/.env` cũ vào contract mới để volume Postgres/Keycloak tiếp tục dùng đúng credential.
+Key mới được append: `GENERATE_ME_*` là secret local mà bootstrap được phép mint;
+`REPLACE_ME_*` phải lấy từ hệ thống sở hữu credential và bootstrap sẽ fail-fast nếu chưa điền.
+Không commit secret. Nếu chỉ cần logic script mới mà chưa muốn regenerate Compose, dừng sau
+`install-project`.
+
 ## Hướng dẫn chạy
 
 Các lệnh bên dưới chạy trong **project đích**, sau khi đã chạy `/docker-claude:install-project` và `/reload-plugins`. Đảm bảo Docker Desktop, Colima hoặc Docker daemon đang hoạt động.
@@ -84,11 +104,19 @@ Hoặc chạy trực tiếp trong terminal:
 ./scripts/bootstrap.sh --yes
 ```
 
-`docker-bootstrap` sẽ lần lượt khởi tạo `infra/` nếu chưa có, kiểm tra `infra/.env`, bật infrastructure và application services, verify environment rồi in các URL localhost. Lệnh không tự xóa container, image hoặc volume.
+`docker-bootstrap` sẽ audit/generate `infra/` nếu chưa có, tạo secret local, bật base
+infra, reconcile PostgreSQL schema + Keycloak realm/client/role + Kafka topic, chạy
+Prisma migration một lần, chờ app ready, verify strict rồi mới in URL. Lệnh không tự
+xóa container, image hoặc volume; verify/provision/migration lỗi làm bootstrap fail.
 
-Ở chế độ `--yes`, các giá trị `REPLACE_ME_*` trong `.env.example` được thay bằng secret local ngẫu nhiên trước khi Docker khởi động; giá trị secret không được in ra output. Generator chuẩn hoá image repository thành lowercase và tự chọn host port còn trống trên máy cho cả app lẫn infra, trong khi container port nội bộ giữ nguyên. Nếu project có Python/Go service chưa có Dockerfile, preflight sẽ yêu cầu quyết định thêm Dockerfile hoặc loại service khỏi plan thay vì tạo compose không build được.
+Ở chế độ `--yes`, chỉ placeholder `GENERATE_ME_*` do local stack sở hữu được thay bằng
+secret ngẫu nhiên trước khi Docker khởi động; giá trị không được in ra. Credential
+ngoài hệ thống giữ marker `REPLACE_ME_*` và làm bootstrap dừng để user cung cấp thật.
+Generator chuẩn hoá image lowercase, chọn host port trống và giữ container port ổn định. Env app được lấy
+từ contract hợp nhất giữa `.env.example`, source config/validation và Prisma — không
+tự bịa `REDIS_URL`, `KEYCLOAK_URL`, topic hay external service.
 
-Khi gọi qua Claude Code, skill sẽ tự scan project trước. Các lựa chọn chắc chắn từ source được áp dụng tự động; các điểm mơ hồ như thiếu/trùng/bị chiếm port, Dockerfile còn thiếu, Dockerfile tạo UID/GID cố định, tên app trùng service infra, tên secret Postgres bị trùng sau chuẩn hoá hoặc dependency chỉ gợi ý module sẽ được gom lại hỏi một lượt theo kiểu Grill Me. Với Node service, plan có thể chọn Dockerfile sẵn có (`service`) hoặc fallback do plugin sinh (`generated`); agent không tự sửa Dockerfile của app. Sau khi nhận câu trả lời, agent tự chạy tiếp đến cuối — user không phải copy lệnh sang terminal.
+Khi gọi qua Claude Code, skill sẽ tự scan project trước. Các lựa chọn chắc chắn từ source được áp dụng tự động; các điểm mơ hồ như credential ngoài hệ thống, thiếu/trùng/bị chiếm port, Dockerfile còn thiếu, Dockerfile tạo UID/GID cố định, tên app trùng service infra, tên secret Postgres bị trùng sau chuẩn hoá hoặc dependency chỉ gợi ý module sẽ được gom lại hỏi một lượt theo kiểu Grill Me. Với Node service, plan có thể chọn Dockerfile sẵn có (`service`) hoặc fallback do plugin sinh (`generated`); agent không tự sửa Dockerfile của app. Sau khi nhận câu trả lời, agent tự chạy tiếp đến cuối — user không phải copy lệnh sang terminal.
 
 Một số biến thể thường dùng:
 
@@ -107,7 +135,10 @@ Nếu `infra/.env` chưa tồn tại, có thể tạo từ template rồi điề
 cp infra/.env.example infra/.env
 ```
 
-Các secret local ngẫu nhiên chỉ dùng để bootstrap môi trường dev; plugin không thể tự suy ra credential/realm/client identity của hệ thống bên ngoài. Không commit `infra/.env` hoặc các file chứa credential.
+Các secret và realm tự sinh chỉ dùng cho local dev. Service-account realm-management
+được cấp quyền rộng để local chạy được và public client có redirect wildcard; không
+dùng output đó cho staging/production. Plugin không thể suy ra quyền Security, realm
+ownership hay external service không có bằng chứng. Không commit `infra/.env`.
 
 ### Chạy từng tác vụ
 
@@ -126,7 +157,8 @@ Các secret local ngẫu nhiên chỉ dùng để bootstrap môi trường dev; 
 | Dừng stack nhưng giữ dữ liệu | `/infra-down` | `./scripts/infra-down.sh` |
 | Chỉ dừng application services | `/infra-down --apps-only` | `./scripts/infra-down.sh --apps-only` |
 
-Ba boundary được `sync-env-docker` hỗ trợ hiện tại là `d-bff-auth-client`, `d-identity-trust` và `d-taxonomy`.
+`sync-env-docker` nhận mọi service trong `infra/contracts/env.json`, resolve container
+qua Compose labels và verify toàn bộ replica; không còn danh sách boundary hardcode.
 
 > **Cảnh báo:** `./scripts/infra-down.sh --volumes` xóa dữ liệu trong named volumes; `--rmi` xóa image do Compose build. Script yêu cầu xác nhận, nhưng chỉ chạy các tùy chọn này khi thực sự muốn xóa dữ liệu hoặc image.
 

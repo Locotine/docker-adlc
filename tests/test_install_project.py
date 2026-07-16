@@ -59,6 +59,10 @@ class InstallProjectTests(unittest.TestCase):
             installed_script = target / "scripts" / "infra-up.sh"
             self.assertTrue(installed_script.is_file())
             self.assertTrue(installed_script.stat().st_mode & stat.S_IXUSR)
+            self.assertEqual(
+                (target / "scripts" / "docker_contract.py").read_bytes(),
+                (ROOT / "scripts" / "docker_contract.py").read_bytes(),
+            )
             self.assertFalse((target / "scripts" / "install-project.py").exists())
             self.assertFalse((target / ".claude" / "settings.local.json").exists())
 

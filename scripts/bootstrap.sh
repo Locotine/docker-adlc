@@ -3,9 +3,9 @@
 #
 # Chain:
 #   1. [init]    if infra/ missing → run infra-init.py (interactive, or defaults with --yes)
-#   2. [env]     if infra/.env missing → warn + offer to copy .env.example (won't auto-fill secrets)
-#   3. [up]      run infra-up.sh (pass through --build, --recreate)
-#   4. [verify]  run sync-env-docker.py verify <svc> for every app service, aggregate report
+#   2. [env]     preserve external credentials; mint only reviewed local-owned secrets
+#   3. [flow]    provision infra/realms/topics, migrate once, start apps
+#   4. [verify]  fail-fast env/infra/realm/topic/container-health verification
 #   5. [urls]    print host URLs for each app (host-port from `docker compose ps`)
 #
 # Flags forwarded to infra-up.sh:
@@ -65,7 +65,7 @@ materialize_placeholder_secrets() {
   tmp="$(mktemp "${env_file}.tmp.XXXXXX")"
   while IFS= read -r line || [ -n "$line" ]; do
     case "$line" in
-      *=REPLACE_ME_*)
+      *=GENERATE_ME_*)
         key="${line%%=*}"
         if ! secret="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"; then
           rm -f "$tmp"
@@ -92,7 +92,7 @@ ROOT="$(find_project_root 2>/dev/null || true)"
 if [ -z "${ROOT:-}" ]; then
   # No infra yet — need init
   ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-  banner "1/4 scaffold infra/"
+  banner "1/5 scaffold infra/"
   echo "  no infra/docker-compose.infra.yml found under $ROOT"
   if [ "$SKIP_INIT" = 1 ]; then
     echo "  --skip-init set → abort. Run scripts/infra-init.py manually." >&2
@@ -110,7 +110,7 @@ if [ -z "${ROOT:-}" ]; then
     echo "  aborted."; exit 1
   fi
 else
-  banner "1/4 scaffold infra/ (skipped — already exists)"
+  banner "1/5 scaffold infra/ (skipped — already exists)"
 fi
 
 # Re-locate root (may have been just created)
@@ -119,15 +119,16 @@ cd "$ROOT/infra"
 
 # ---------- 2. env ----------
 
-banner "2/4 check infra/.env"
+banner "2/5 check infra/.env"
 if [ -f .env ]; then
   echo "  infra/.env exists ($(wc -l <.env) lines)"
 elif [ -f .env.example ]; then
   echo "  infra/.env missing but .env.example present."
   if ask_confirm "  copy .env.example → .env (you MUST fill in real secrets after)?"; then
     cp .env.example .env
+    chmod 600 .env
     if [ "$ASSUME_YES" = 1 ]; then
-      echo "  copied; automatic mode will replace placeholder secrets."
+      echo "  copied; local-owned placeholders will be generated automatically."
     else
       echo "  copied. Edit infra/.env now if apps reference \${VAR:?...}."
       if ! ask_confirm "  continue to up-step now (apps may fail if secrets not filled)?"; then
@@ -141,28 +142,39 @@ else
   echo "  no .env / .env.example found — assuming apps don't need secret vars."
 fi
 
-if [ "$ASSUME_YES" = 1 ] && [ -f .env ] && grep -q '=REPLACE_ME_' .env; then
+if [ -f .env ] && grep -q '=GENERATE_ME_' .env; then
   materialize_placeholder_secrets .env
+fi
+if [ -f .env ] && grep -q '=REPLACE_ME_' .env; then
+  echo "error: external credentials still require explicit values in infra/.env:" >&2
+  awk -F= '$2 ~ /^REPLACE_ME_/ { print "  - " $1 }' .env >&2
+  echo "docker-claude never invents credentials owned by an external system." >&2
+  exit 2
 fi
 
 # ---------- 3. up ----------
 
-banner "3/4 docker compose up"
+banner "3/5 provision, migrate, and start"
 "$SCRIPT_DIR/infra-up.sh" $BUILD $RECREATE
 
 # ---------- 4. verify ----------
 
 if [ "$SKIP_VERIFY" = 1 ]; then
-  banner "4/4 verify (skipped by --skip-verify)"
+  banner "4/5 verify (skipped by --skip-verify)"
 else
-  banner "4/4 sync-env-docker verify"
+  banner "4/5 strict contract verify"
   # Discover app service names from docker-compose.apps.yml (services under `services:` root)
   APPS=""
-  if [ -f "$ROOT/infra/docker-compose.apps.yml" ]; then
+  if [ -f "$ROOT/infra/contracts/env.json" ]; then
+    APPS="$(python3 -c 'import json,sys; print(*json.load(open(sys.argv[1]))["services"], sep="\n")' \
+      "$ROOT/infra/contracts/env.json")"
+  elif [ -f "$ROOT/infra/docker-compose.apps.yml" ]; then
     APPS="$(awk '
       /^services:/ { in_services=1; next }
       in_services && /^[a-zA-Z]/ { in_services=0 }
-      in_services && /^  [a-zA-Z0-9_-]+:/ { gsub(":",""); gsub(" ",""); print }
+      in_services && /^  [a-zA-Z0-9_-]+:/ {
+        gsub(":",""); gsub(" ",""); if ($0 !~ /-migrate$/) print
+      }
     ' "$ROOT/infra/docker-compose.apps.yml")"
   fi
   if [ -z "$APPS" ]; then
@@ -180,13 +192,16 @@ else
       echo "      - PLACEHOLDER: mint real value into infra/.env then ./scripts/docker-apps-up.sh <svc> --recreate"
       echo "      - MISMATCH: edit infra/docker-compose.apps.yml env, then --recreate"
       echo "      - MISSING: add key to infra/docker-compose.apps.yml env block"
+      echo
+      echo "  bootstrap failed: the generated stack is not ready for use." >&2
+      exit 1
     fi
   fi
 fi
 
 # ---------- 5. urls ----------
 
-banner "urls"
+banner "5/5 urls"
 if [ -f "$ROOT/infra/docker-compose.apps.yml" ]; then
   docker compose -f "$ROOT/infra/docker-compose.infra.yml" -f "$ROOT/infra/docker-compose.apps.yml" \
     ps --format '{{.Name}}\t{{.Ports}}' 2>/dev/null \

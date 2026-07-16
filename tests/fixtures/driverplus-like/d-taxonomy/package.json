@@ -1,0 +1,11 @@
+{
+  "name": "d-taxonomy",
+  "engines": {"node": ">=24.0.0 <25"},
+  "scripts": {"build": "nest build", "prod": "node dist/main.js"},
+  "dependencies": {
+    "@prisma/client": "5.22.0",
+    "prisma": "5.22.0",
+    "ioredis": "5.4.1",
+    "kafkajs": "2.2.4"
+  }
+}

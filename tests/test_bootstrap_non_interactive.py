@@ -115,7 +115,6 @@ class BootstrapNonInteractiveTests(unittest.TestCase):
                 ("dockerfile_fixed_identity", "D-IDENTITY-TRUST"),
                 dockerfile_uncertainties,
             )
-            self.assertIn(("missing_dockerfile", "D-TAXONOMY"), dockerfile_uncertainties)
 
             # Simulate the reviewed choice to avoid the risky service Dockerfile.
             config["services"]["D-IDENTITY-TRUST"]["dockerfile"] = "generated"
@@ -357,7 +356,7 @@ class BootstrapNonInteractiveTests(unittest.TestCase):
             scripts.mkdir(parents=True)
             fake_bin.mkdir()
 
-            for name in ("_common.sh", "bootstrap.sh", "infra-init.py"):
+            for name in ("_common.sh", "bootstrap.sh", "infra-init.py", "docker_contract.py"):
                 shutil.copy2(ROOT / "scripts" / name, scripts / name)
 
             self._write_executable(
@@ -432,7 +431,7 @@ class BootstrapNonInteractiveTests(unittest.TestCase):
             scripts.mkdir(parents=True)
             fake_bin.mkdir()
 
-            for name in ("_common.sh", "bootstrap.sh", "infra-init.py"):
+            for name in ("_common.sh", "bootstrap.sh", "infra-init.py", "docker_contract.py"):
                 shutil.copy2(ROOT / "scripts" / name, scripts / name)
             self._write_executable(
                 scripts / "infra-up.sh",
@@ -698,7 +697,7 @@ class BootstrapNonInteractiveTests(unittest.TestCase):
             project = Path(tmp)
             scripts = project / "scripts"
             scripts.mkdir()
-            for name in ("_common.sh", "bootstrap.sh", "infra-init.py"):
+            for name in ("_common.sh", "bootstrap.sh", "infra-init.py", "docker_contract.py"):
                 shutil.copy2(ROOT / "scripts" / name, scripts / name)
 
             result = subprocess.run(
@@ -716,10 +715,264 @@ class BootstrapNonInteractiveTests(unittest.TestCase):
             self.assertIn("no service candidates found", result.stdout)
             self.assertFalse((project / "infra").exists())
 
+    def test_bootstrap_fails_when_strict_verify_reports_a_problem(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            scripts = project / "scripts"
+            infra = project / "infra"
+            contracts = infra / "contracts"
+            fake_bin = project / "test-bin"
+            scripts.mkdir()
+            contracts.mkdir(parents=True)
+            fake_bin.mkdir()
+            for name in ("_common.sh", "bootstrap.sh"):
+                shutil.copy2(ROOT / "scripts" / name, scripts / name)
+            self._write_executable(
+                scripts / "infra-up.sh",
+                "#!/usr/bin/env bash\nset -euo pipefail\necho provisioned\n",
+            )
+            self._write_executable(
+                scripts / "sync-env-docker.py",
+                "#!/usr/bin/env bash\necho '[MISSING] REQUIRED_KEY'\nexit 1\n",
+            )
+            self._write_executable(fake_bin / "docker", "#!/usr/bin/env bash\nexit 0\n")
+            (infra / "docker-compose.infra.yml").write_text("name: strict-test\nservices: {}\n")
+            (infra / "docker-compose.apps.yml").write_text("services:\n  api:\n    image: api\n")
+            (infra / ".env").write_text("SECRET=local\n")
+            (contracts / "env.json").write_text(json.dumps({"services": {"api": {}}}))
+            env = os.environ.copy()
+            env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+
+            result = subprocess.run(
+                [str(scripts / "bootstrap.sh"), "--yes"],
+                cwd=project,
+                env=env,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 1, result.stdout)
+            self.assertIn("bootstrap failed", result.stdout)
+            self.assertNotIn("done.", result.stdout)
+
+    def test_bootstrap_never_invents_an_external_app_credential(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            scripts = project / "scripts"
+            infra = project / "infra"
+            scripts.mkdir()
+            infra.mkdir()
+            for name in ("_common.sh", "bootstrap.sh"):
+                shutil.copy2(ROOT / "scripts" / name, scripts / name)
+            self._write_executable(
+                scripts / "infra-up.sh",
+                "#!/usr/bin/env bash\necho should-not-run\nexit 0\n",
+            )
+            (infra / "docker-compose.infra.yml").write_text(
+                "name: external-secret\nservices: {}\n"
+            )
+            (infra / ".env.example").write_text(
+                "STRIPE_API_KEY=REPLACE_ME_STRIPE_API_KEY\n"
+            )
+
+            result = subprocess.run(
+                [str(scripts / "bootstrap.sh"), "--yes", "--skip-verify"],
+                cwd=project,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 2, result.stdout)
+            self.assertIn("STRIPE_API_KEY", result.stdout)
+            self.assertIn("never invents credentials", result.stdout)
+            self.assertNotIn("should-not-run", result.stdout)
+            self.assertIn("REPLACE_ME_STRIPE_API_KEY", (infra / ".env").read_text())
+            self.assertEqual(stat.S_IMODE((infra / ".env").stat().st_mode), 0o600)
+
+    def test_infra_up_derives_urlencoded_database_password_without_changing_raw_secret(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            scripts = project / "scripts"
+            infra = project / "infra"
+            contracts = infra / "contracts"
+            fake_bin = project / "test-bin"
+            scripts.mkdir()
+            contracts.mkdir(parents=True)
+            fake_bin.mkdir()
+            for name in ("_common.sh", "infra-up.sh"):
+                shutil.copy2(ROOT / "scripts" / name, scripts / name)
+            (infra / "docker-compose.infra.yml").write_text(
+                "name: encoded-secret\nservices: {}\n"
+            )
+            (infra / ".env").write_text("APP_DB_PASSWORD='slash/#at@value'\n")
+            (contracts / "postgres.json").write_text(json.dumps({
+                "databases": [{"name": "app", "password_env": "APP_DB_PASSWORD"}],
+            }))
+            self._write_executable(
+                fake_bin / "docker",
+                "#!/usr/bin/env bash\nexit 0\n",
+            )
+            env = os.environ.copy()
+            env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+
+            result = subprocess.run(
+                [str(scripts / "infra-up.sh"), "--infra-only"],
+                cwd=project,
+                env=env,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout)
+            env_text = (infra / ".env").read_text()
+            self.assertIn("APP_DB_PASSWORD='slash/#at@value'", env_text)
+            self.assertIn(
+                "APP_DB_PASSWORD_URLENCODED=slash%2F%23at%40value", env_text
+            )
+            self.assertEqual(stat.S_IMODE((infra / ".env").stat().st_mode), 0o600)
+
+    def test_infra_up_orders_reconcile_migrate_and_app_start(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            scripts = project / "scripts"
+            infra = project / "infra"
+            contracts = infra / "contracts"
+            fake_bin = project / "test-bin"
+            scripts.mkdir()
+            contracts.mkdir(parents=True)
+            fake_bin.mkdir()
+            for name in ("_common.sh", "infra-up.sh"):
+                shutil.copy2(ROOT / "scripts" / name, scripts / name)
+            (infra / "docker-compose.infra.yml").write_text("name: ordered\nservices: {}\n")
+            (infra / "docker-compose.apps.yml").write_text("services: {}\n")
+            (infra / ".env").write_text("SECRET=local\n")
+            (contracts / "env.json").write_text(json.dumps({"services": {"api": {}}}))
+            log = project / "docker.log"
+            self._write_executable(
+                fake_bin / "docker",
+                "#!/usr/bin/env bash\n"
+                "printf '%s\\n' \"$*\" >>\"$DOCKER_LOG\"\n"
+                "case \"$*\" in\n"
+                "  *'config --services'*) printf '%s\\n' postgres postgres-provision keycloak-provision kafka-provision api api-migrate ;;\n"
+                "esac\n"
+                "exit 0\n",
+            )
+            env = os.environ.copy()
+            env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+            env["DOCKER_LOG"] = str(log)
+
+            result = subprocess.run(
+                [str(scripts / "infra-up.sh"), "--build"],
+                cwd=project,
+                env=env,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout)
+            commands = log.read_text().splitlines()
+            indices = {
+                "postgres_up": next(i for i, line in enumerate(commands) if "up -d --wait postgres" in line),
+                "postgres_reconcile": next(i for i, line in enumerate(commands) if "run --rm postgres-provision" in line),
+                "keycloak": next(i for i, line in enumerate(commands) if "run --rm keycloak-provision" in line),
+                "kafka": next(i for i, line in enumerate(commands) if "run --rm kafka-provision" in line),
+                "build": next(i for i, line in enumerate(commands) if " build api" in line),
+                "migrate": next(i for i, line in enumerate(commands) if "run --rm api-migrate" in line),
+                "apps": next(i for i, line in enumerate(commands) if "up -d --wait --build api" in line),
+            }
+            self.assertEqual(list(indices.values()), sorted(indices.values()))
+
+    def test_infra_up_stops_before_build_when_provisioning_fails(self) -> None:
+        result, commands = self._run_infra_up_with_docker_failure(
+            "run --rm keycloak-provision"
+        )
+
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertTrue(any("run --rm keycloak-provision" in line for line in commands))
+        self.assertFalse(any(" build api" in line for line in commands))
+        self.assertFalse(any("up -d --wait api" in line for line in commands))
+
+    def test_infra_up_stops_before_apps_and_explains_failed_migration(self) -> None:
+        result, commands = self._run_infra_up_with_docker_failure("run --rm api-migrate")
+
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("prisma migrate resolve", result.stdout)
+        self.assertTrue(any("run --rm api-migrate" in line for line in commands))
+        self.assertFalse(any("up -d --wait api" in line for line in commands))
+
+    def _run_infra_up_with_docker_failure(
+        self, failure_fragment: str
+    ) -> tuple[subprocess.CompletedProcess[str], list[str]]:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        project = Path(temporary.name)
+        scripts = project / "scripts"
+        infra = project / "infra"
+        contracts = infra / "contracts"
+        fake_bin = project / "test-bin"
+        scripts.mkdir()
+        contracts.mkdir(parents=True)
+        fake_bin.mkdir()
+        for name in ("_common.sh", "infra-up.sh"):
+            shutil.copy2(ROOT / "scripts" / name, scripts / name)
+        (infra / "docker-compose.infra.yml").write_text("name: failure-test\nservices: {}\n")
+        (infra / "docker-compose.apps.yml").write_text("services: {}\n")
+        (infra / ".env").write_text("SECRET=local\n")
+        (contracts / "env.json").write_text(json.dumps({"services": {"api": {}}}))
+        log = project / "docker.log"
+        self._write_executable(
+            fake_bin / "docker",
+            "#!/usr/bin/env bash\n"
+            "printf '%s\\n' \"$*\" >>\"$DOCKER_LOG\"\n"
+            "case \"$*\" in\n"
+            "  *'config --services'*) printf '%s\\n' postgres postgres-provision keycloak-provision kafka-provision api api-migrate ;;\n"
+            "esac\n"
+            "case \"$*\" in\n"
+            "  *\"$FAIL_AT\"*) exit 17 ;;\n"
+            "esac\n"
+            "exit 0\n",
+        )
+        env = os.environ.copy()
+        env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+        env["DOCKER_LOG"] = str(log)
+        env["FAIL_AT"] = failure_fragment
+        result = subprocess.run(
+            [str(scripts / "infra-up.sh")],
+            cwd=project,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+        return result, log.read_text().splitlines()
+
     @staticmethod
     def _write_node_service(path: Path, dependencies: Dict[str, str], port: int) -> None:
         path.mkdir()
-        (path / "package.json").write_text(json.dumps({"dependencies": dependencies}))
+        (path / "package.json").write_text(json.dumps({
+            "engines": {"node": ">=24.0.0"},
+            "scripts": {"build": "echo build", "prod": "node dist/main.js"},
+            "dependencies": dependencies,
+        }))
         (path / ".env.example").write_text(f"PORT={port}\n")
 
     @staticmethod

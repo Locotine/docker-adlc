@@ -1,0 +1,1 @@
+CREATE TABLE "taxonomy"."Node" ("id" TEXT NOT NULL PRIMARY KEY);
