@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """infra-init — scaffold shared Docker infra for a multi-service project.
 
-Interactive workflow:
+Interactive or non-interactive workflow:
   1. Detect candidate service folders (dir với package.json / go.mod / pyproject.toml).
   2. Parse tech-stack hints (deps in package.json, imports) to guess needed infra:
         prisma|pg|typeorm         → postgres
@@ -11,8 +11,10 @@ Interactive workflow:
         @temporalio/*              → temporal
         @aws-sdk/client-s3|minio   → minio
         @elastic/elasticsearch     → elasticsearch
-  3. Prompt user to confirm services, port mapping, compose project name.
-  4. Prompt to enable/disable each detected infra module.
+  3. Prompt user to confirm services, port mapping, compose project name, or use
+     detected defaults with --yes.
+  4. Prompt to enable/disable each detected infra module, or enable detected
+     modules with --yes.
   5. Generate `infra/` next to the services:
         infra/docker-compose.infra.yml
         infra/docker-compose.apps.yml
@@ -38,7 +40,7 @@ import shutil
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 # ---------- Dependency → infra module map ----------
 
@@ -208,6 +210,12 @@ def ask_int(prompt: str, default: int) -> int:
 
 INFRA_MODULES_ALL = ["postgres", "redis", "kafka", "keycloak", "temporal", "minio", "elasticsearch"]
 
+# These dependencies are useful hints, but do not prove that the module is used
+# in this particular service. Agents should confirm them during preflight.
+AMBIGUOUS_DEP_HINTS = {
+    "@nestjs/microservices": "kafka",
+}
+
 # Internal hostname each module uses (referenced from apps compose)
 MODULE_HOST = {
     "postgres": "postgres",
@@ -220,7 +228,146 @@ MODULE_HOST = {
 }
 
 
-def build_plan(root: Path, force: bool) -> InitPlan:
+def _default_modules(cands: List[ServiceCandidate]) -> List[str]:
+    aggregate: Set[str] = set()
+    for service in cands:
+        aggregate.update(service.detected_infra)
+    if aggregate.intersection({"keycloak", "temporal"}):
+        aggregate.add("postgres")
+    return [module for module in INFRA_MODULES_ALL if module in aggregate]
+
+
+def _default_ports(cands: List[ServiceCandidate]) -> Dict[str, Tuple[int, int]]:
+    ports: Dict[str, Tuple[int, int]] = {}
+    used_host_ports: Set[int] = set()
+    next_port = 4000
+    for service in cands:
+        host_port = service.detected_port or next_port
+        while host_port in used_host_ports:
+            host_port = max(host_port + 1, next_port)
+        container_port = service.detected_port or 3000
+        ports[service.name] = (host_port, container_port)
+        used_host_ports.add(host_port)
+        next_port = host_port + 1
+    return ports
+
+
+def detection_report(root: Path) -> Dict[str, Any]:
+    """Return machine-readable facts and suggested defaults without prompting."""
+    cands = scan_candidates(root)
+    project_name = root.name.lower().replace(" ", "-")
+    default_ports = _default_ports(cands)
+    services: Dict[str, Dict[str, Any]] = {}
+    uncertainties: List[Dict[str, Any]] = []
+    detected_port_owners: Dict[int, str] = {}
+
+    if not cands:
+        uncertainties.append({
+            "type": "no_candidates",
+            "question": (
+                "No service candidates were found; is this the correct project root, "
+                "or do services need to be added first?"
+            ),
+        })
+
+    for service in cands:
+        host_port, container_port = default_ports[service.name]
+        services[service.name] = {
+            "include": True,
+            "host_port": host_port,
+            "container_port": container_port,
+            "language": service.language,
+            "has_dockerfile": service.has_dockerfile,
+            "detected_port": service.detected_port,
+            "detected_infra": sorted(service.detected_infra),
+        }
+        if service.detected_port is None:
+            uncertainties.append({
+                "type": "missing_port",
+                "service": service.name,
+                "question": (
+                    f"No PORT was detected for {service.name}; "
+                    f"use host {host_port} -> container {container_port}?"
+                ),
+            })
+        elif service.detected_port in detected_port_owners:
+            uncertainties.append({
+                "type": "duplicate_port",
+                "service": service.name,
+                "conflicts_with": detected_port_owners[service.detected_port],
+                "question": (
+                    f"{service.name} and {detected_port_owners[service.detected_port]} "
+                    f"both declare PORT={service.detected_port}; use host port {host_port} "
+                    f"for {service.name}?"
+                ),
+            })
+        else:
+            detected_port_owners[service.detected_port] = service.name
+
+        if service.language != "node" and not service.has_dockerfile:
+            uncertainties.append({
+                "type": "missing_dockerfile",
+                "service": service.name,
+                "question": (
+                    f"{service.name} is {service.language} and has no Dockerfile; "
+                    "exclude it or add a Dockerfile before bootstrap?"
+                ),
+            })
+        for dependency, module in AMBIGUOUS_DEP_HINTS.items():
+            if dependency in service.deps:
+                uncertainties.append({
+                    "type": "ambiguous_module",
+                    "service": service.name,
+                    "dependency": dependency,
+                    "module": module,
+                    "question": (
+                        f"{service.name} depends on {dependency}, which may use several "
+                        f"transports; should {module} be enabled?"
+                    ),
+                })
+
+    modules = _default_modules(cands)
+    if cands and not modules:
+        uncertainties.append({
+            "type": "no_infra_detected",
+            "question": "No infra modules were detected; should bootstrap run apps without shared infra?",
+        })
+
+    return {
+        "project_root": str(root),
+        "candidates": sorted(services),
+        "suggested_config": {
+            "project_name": project_name,
+            "network_name": project_name,
+            "services": services,
+            "infra_modules": modules,
+        },
+        "uncertainties": uncertainties,
+    }
+
+
+def load_plan_config(path: Path) -> Dict[str, Any]:
+    try:
+        config = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"error: cannot read init config {path}: {exc}", file=sys.stderr)
+        sys.exit(2)
+    if not isinstance(config, dict):
+        print("error: init config must be a JSON object", file=sys.stderr)
+        sys.exit(2)
+    # Allow agents to save either suggested_config itself or the full detect report.
+    suggested = config.get("suggested_config")
+    if isinstance(suggested, dict):
+        config = suggested
+    return config
+
+
+def build_plan(
+    root: Path,
+    force: bool,
+    assume_defaults: bool = False,
+    config: Optional[Dict[str, Any]] = None,
+) -> InitPlan:
     print(f"scanning {root}...")
     cands = scan_candidates(root)
     if not cands:
@@ -237,18 +384,82 @@ def build_plan(root: Path, force: bool) -> InitPlan:
     print()
     # 1) project meta
     default_name = root.name.lower().replace(" ", "-")
-    project_name = ask("Compose project name (docker -p)", default_name)
-    network_name = ask("Docker network name", project_name)
+    if config is not None:
+        project_name = str(config.get("project_name") or default_name)
+        network_name = str(config.get("network_name") or project_name)
+        print("  --config: using reviewed choices without prompting")
+        print(f"  compose project name: {project_name}")
+        print(f"  docker network name : {network_name}")
+    elif assume_defaults:
+        project_name = default_name
+        network_name = project_name
+        print("  --yes: using detected defaults without prompting")
+        print(f"  compose project name: {project_name}")
+        print(f"  docker network name : {network_name}")
+    else:
+        project_name = ask("Compose project name (docker -p)", default_name)
+        network_name = ask("Docker network name", project_name)
 
     # 2) per-service confirm + port
     print("\n--- select services to include ---")
     next_port = 4000
+    used_host_ports: Set[int] = set()
+    default_ports = _default_ports(cands)
+    service_config = config.get("services", {}) if config is not None else {}
+    if not isinstance(service_config, dict):
+        print("error: config.services must be an object keyed by service name", file=sys.stderr)
+        sys.exit(2)
+    unknown_services = set(service_config).difference(service.name for service in cands)
+    if unknown_services:
+        print(
+            f"error: config contains unknown services: {', '.join(sorted(unknown_services))}",
+            file=sys.stderr,
+        )
+        sys.exit(2)
     for s in cands:
-        s.include = ask_yn(f"include '{s.name}'?", True)
+        choice = service_config.get(s.name, {})
+        if not isinstance(choice, dict):
+            print(f"error: config.services.{s.name} must be an object", file=sys.stderr)
+            sys.exit(2)
+        if config is not None:
+            include = choice.get("include", True)
+            if not isinstance(include, bool):
+                print(f"error: config.services.{s.name}.include must be boolean", file=sys.stderr)
+                sys.exit(2)
+            s.include = include
+        else:
+            s.include = True if assume_defaults else ask_yn(f"include '{s.name}'?", True)
         if s.include:
+            if s.language != "node" and not s.has_dockerfile:
+                print(
+                    f"error: {s.name} is {s.language} and has no Dockerfile; "
+                    "add one or exclude the service via a reviewed --config plan",
+                    file=sys.stderr,
+                )
+                sys.exit(2)
             default_port = s.detected_port or next_port
-            s.host_port = ask_int(f"  host port for {s.name}", default_port)
-            s.container_port = ask_int(f"  container port for {s.name}", s.detected_port or 3000)
+            if config is not None or assume_defaults:
+                suggested_host, suggested_container = default_ports[s.name]
+                try:
+                    s.host_port = int(choice.get("host_port", suggested_host))
+                    s.container_port = int(choice.get("container_port", suggested_container))
+                except (TypeError, ValueError):
+                    print(f"error: ports for {s.name} must be integers", file=sys.stderr)
+                    sys.exit(2)
+                if not (1 <= s.host_port <= 65535 and 1 <= s.container_port <= 65535):
+                    print(f"error: ports for {s.name} must be between 1 and 65535", file=sys.stderr)
+                    sys.exit(2)
+                if s.host_port in used_host_ports:
+                    print(f"error: duplicate host port {s.host_port} in init config", file=sys.stderr)
+                    sys.exit(2)
+                print(
+                    f"  include {s.name}: "
+                    f"host {s.host_port} -> container {s.container_port}"
+                )
+            else:
+                s.host_port = ask_int(f"  host port for {s.name}", default_port)
+                s.container_port = ask_int(f"  container port for {s.name}", s.detected_port or 3000)
+            used_host_ports.add(s.host_port)
             next_port = s.host_port + 1
 
     included = [s for s in cands if s.include]
@@ -257,16 +468,46 @@ def build_plan(root: Path, force: bool) -> InitPlan:
         sys.exit(1)
 
     # 3) aggregate detected infra + prompt each
-    aggregate = set()
+    aggregate: Set[str] = set()
     for s in included:
         aggregate.update(s.detected_infra)
     print("\n--- infra modules ---")
     print(f"  auto-detected from tech stack: {sorted(aggregate) or 'none'}")
-    modules: List[str] = []
-    for m in INFRA_MODULES_ALL:
-        default = m in aggregate
-        if ask_yn(f"  enable '{m}'?", default):
-            modules.append(m)
+    if config is not None:
+        configured_modules = config.get("infra_modules", _default_modules(included))
+        if not isinstance(configured_modules, list) or not all(
+            isinstance(module, str) for module in configured_modules
+        ):
+            print("error: config.infra_modules must be a list of module names", file=sys.stderr)
+            sys.exit(2)
+        unknown_modules = set(configured_modules).difference(INFRA_MODULES_ALL)
+        if unknown_modules:
+            print(
+                f"error: unknown infra modules: {', '.join(sorted(unknown_modules))}",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        modules = [module for module in INFRA_MODULES_ALL if module in configured_modules]
+        required_postgres = set(modules).intersection({"keycloak", "temporal"})
+        if required_postgres and "postgres" not in modules:
+            print(
+                "error: postgres is required when keycloak or temporal is enabled",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        print(f"  --config: enabling {', '.join(modules) or '<none>'}")
+    elif assume_defaults:
+        # Keycloak and Temporal use the generated Postgres service internally.
+        if aggregate.intersection({"keycloak", "temporal"}):
+            aggregate.add("postgres")
+        modules = [m for m in INFRA_MODULES_ALL if m in aggregate]
+        print(f"  --yes: enabling {', '.join(modules) or '<none>'}")
+    else:
+        modules = []
+        for m in INFRA_MODULES_ALL:
+            default = m in aggregate
+            if ask_yn(f"  enable '{m}'?", default):
+                modules.append(m)
 
     return InitPlan(
         project_root=root,
@@ -800,15 +1041,34 @@ def main() -> int:
     ap = argparse.ArgumentParser(prog="infra-init", description=__doc__.split("\n")[0])
     ap.add_argument("--root", default=None, help="Project root (default: parent of scripts/)")
     ap.add_argument("--force", action="store_true", help="Overwrite existing infra/ (backup made)")
+    mode = ap.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--yes", "-y",
+        action="store_true",
+        help="Use detected defaults and write without interactive prompts",
+    )
+    mode.add_argument(
+        "--config",
+        help="Use reviewed choices from a JSON config without interactive prompts",
+    )
+    mode.add_argument(
+        "--detect-json",
+        action="store_true",
+        help="Print detected facts, suggested config, and uncertainties as JSON; write nothing",
+    )
     args = ap.parse_args()
 
     root = Path(args.root).resolve() if args.root else Path(__file__).resolve().parent.parent
     if not root.exists():
         print(f"error: root {root} not found", file=sys.stderr)
         return 2
+    if args.detect_json:
+        print(json.dumps(detection_report(root), indent=2, sort_keys=True))
+        return 0
     print(f"project root: {root}\n")
 
-    plan = build_plan(root, args.force)
+    config = load_plan_config(Path(args.config).resolve()) if args.config else None
+    plan = build_plan(root, args.force, assume_defaults=args.yes, config=config)
 
     # Summary
     print("\n=== plan ===")
@@ -816,7 +1076,7 @@ def main() -> int:
     print(f"  network       : {plan.network_name}")
     print(f"  services      : {', '.join(f'{s.name}:{s.host_port}' for s in plan.services)}")
     print(f"  infra modules : {', '.join(plan.infra_modules) or '<none>'}")
-    if not ask_yn("\nwrite files?", True):
+    if not (args.yes or config is not None) and not ask_yn("\nwrite files?", True):
         print("aborted.")
         return 1
 

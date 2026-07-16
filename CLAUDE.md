@@ -1,13 +1,13 @@
 # Docker Claude Toolkit
 
-This repository is both a Claude Code marketplace and the `docker-claude` plugin source. Its purpose is to install reusable Docker infrastructure skills and scripts into other projects without replacing their existing `.claude/` or `scripts/` directories.
+This repository is both a Claude Code marketplace and the `docker-claude` plugin source. Its purpose is to synchronize reusable Docker infrastructure skills and scripts into other projects without replacing their entire `.claude/` or `scripts/` directories.
 
 ## Repository layout
 
 - `.claude-plugin/marketplace.json` defines the `driverplus-tools` marketplace.
 - `.claude-plugin/plugin.json` defines the `docker-claude` plugin and its version.
 - `skills/install-project/SKILL.md` is the plugin-facing installer skill.
-- `scripts/install-project.py` merges payload files into a target project without overwriting existing files.
+- `scripts/install-project.py` synchronizes payload files into a target project, overwriting same-path plugin-managed files while preserving unrelated files.
 - `.claude/skills/` contains the six standalone project skills copied by the installer.
 - `scripts/` contains the operational Docker scripts copied by the installer. `install-project.py` itself is excluded from the payload.
 - `tests/test_install_project.py` verifies installer safety and idempotency.
@@ -33,11 +33,11 @@ Do not invent a generic Docker workflow when one of these existing skills covers
 Changes to `scripts/install-project.py` must preserve all of these rules:
 
 1. Merge files individually; never delete or replace an entire destination directory.
-2. Copy only files that do not exist at the destination.
-3. Leave identical files unchanged.
-4. Report same-path/different-content files as conflicts and preserve the project-owned version.
+2. Copy missing plugin-managed files and overwrite different regular files at the same payload paths.
+3. Leave identical files unchanged and preserve all unrelated files.
+4. Apply overwrites atomically and reject destination symlinks or non-regular files.
 5. Reject symlink escapes and invalid destination parents before copying anything.
-6. Preserve executable modes on copied scripts.
+6. Preserve executable modes on copied and overwritten scripts.
 7. Exclude `scripts/install-project.py`, `.claude/settings.local.json`, caches, and test artifacts from the project payload.
 
 ## Verification

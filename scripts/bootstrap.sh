@@ -2,7 +2,7 @@
 # bootstrap — one-shot end-to-end flow for the project.
 #
 # Chain:
-#   1. [init]    if infra/ missing → run infra-init.py (interactive scaffold)
+#   1. [init]    if infra/ missing → run infra-init.py (interactive, or defaults with --yes)
 #   2. [env]     if infra/.env missing → warn + offer to copy .env.example (won't auto-fill secrets)
 #   3. [up]      run infra-up.sh (pass through --build, --recreate)
 #   4. [verify]  run sync-env-docker.py verify <svc> for every app service, aggregate report
@@ -15,7 +15,8 @@
 # Flags local to bootstrap:
 #   --skip-init     Do not scaffold even if infra/ missing (fail instead)
 #   --skip-verify   Skip step 4
-#   --yes           Assume "yes" to all bootstrap prompts (init trigger, env copy)
+#   --yes           Run end-to-end without prompts; infra-init uses detected defaults
+#   --init-config PATH  Use a reviewed infra-init JSON config (implies --yes)
 #   -h, --help      Show this help
 
 # shellcheck source=./_common.sh
@@ -28,16 +29,24 @@ RECREATE=""
 SKIP_INIT=0
 SKIP_VERIFY=0
 ASSUME_YES=0
-for arg in "$@"; do
-  case "$arg" in
+INIT_CONFIG=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
     --build) BUILD="--build" ;;
     --recreate) RECREATE="--recreate" ;;
     --skip-init) SKIP_INIT=1 ;;
     --skip-verify) SKIP_VERIFY=1 ;;
     --yes|-y) ASSUME_YES=1 ;;
-    -h|--help) sed -n '2,22p' "$0"; exit 0 ;;
-    *) echo "unknown flag: $arg" >&2; exit 2 ;;
+    --init-config)
+      shift
+      [ "$#" -gt 0 ] || { echo "--init-config requires a JSON path" >&2; exit 2; }
+      INIT_CONFIG="$1"
+      ASSUME_YES=1
+      ;;
+    -h|--help) sed -n '2,23p' "$0"; exit 0 ;;
+    *) echo "unknown flag: $1" >&2; exit 2 ;;
   esac
+  shift
 done
 
 ask_confirm() {
@@ -47,6 +56,30 @@ ask_confirm() {
   printf '%s [y/N]: ' "$prompt"
   read -r ans
   case "$ans" in y|Y|yes|YES) return 0 ;; *) return 1 ;; esac
+}
+
+materialize_placeholder_secrets() {
+  local env_file="$1"
+  local tmp line key secret generated
+  generated=0
+  tmp="$(mktemp "${env_file}.tmp.XXXXXX")"
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      *=REPLACE_ME_*)
+        key="${line%%=*}"
+        if ! secret="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"; then
+          rm -f "$tmp"
+          return 1
+        fi
+        printf '%s=%s\n' "$key" "$secret" >>"$tmp"
+        generated=$((generated + 1))
+        ;;
+      *) printf '%s\n' "$line" >>"$tmp" ;;
+    esac
+  done <"$env_file"
+  chmod 600 "$tmp"
+  mv "$tmp" "$env_file"
+  echo "  generated $generated random local secret(s) in infra/.env (values hidden)."
 }
 
 banner() {
@@ -65,8 +98,14 @@ if [ -z "${ROOT:-}" ]; then
     echo "  --skip-init set → abort. Run scripts/infra-init.py manually." >&2
     exit 2
   fi
-  if ask_confirm "  run scripts/infra-init.py now (interactive)?"; then
-    "$SCRIPT_DIR/infra-init.py" --root "$ROOT"
+  if ask_confirm "  run scripts/infra-init.py now?"; then
+    INIT_ARGS=(--root "$ROOT")
+    if [ -n "$INIT_CONFIG" ]; then
+      INIT_ARGS+=(--config "$INIT_CONFIG")
+    elif [ "$ASSUME_YES" = 1 ]; then
+      INIT_ARGS+=(--yes)
+    fi
+    "$SCRIPT_DIR/infra-init.py" "${INIT_ARGS[@]}"
   else
     echo "  aborted."; exit 1
   fi
@@ -87,15 +126,23 @@ elif [ -f .env.example ]; then
   echo "  infra/.env missing but .env.example present."
   if ask_confirm "  copy .env.example → .env (you MUST fill in real secrets after)?"; then
     cp .env.example .env
-    echo "  copied. Edit infra/.env now if apps reference \${VAR:?...}."
-    if ! ask_confirm "  continue to up-step now (apps may fail if secrets not filled)?"; then
-      echo "  paused. Re-run bootstrap when .env is ready."; exit 0
+    if [ "$ASSUME_YES" = 1 ]; then
+      echo "  copied; automatic mode will replace placeholder secrets."
+    else
+      echo "  copied. Edit infra/.env now if apps reference \${VAR:?...}."
+      if ! ask_confirm "  continue to up-step now (apps may fail if secrets not filled)?"; then
+        echo "  paused. Re-run bootstrap when .env is ready."; exit 0
+      fi
     fi
   else
     echo "  skipped. apps may fail to start."
   fi
 else
   echo "  no .env / .env.example found — assuming apps don't need secret vars."
+fi
+
+if [ "$ASSUME_YES" = 1 ] && [ -f .env ] && grep -q '=REPLACE_ME_' .env; then
+  materialize_placeholder_secrets .env
 fi
 
 # ---------- 3. up ----------

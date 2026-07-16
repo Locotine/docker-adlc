@@ -1,13 +1,13 @@
 ---
 name: install-project
-description: Merge the Docker Claude toolkit's .claude skills and scripts into the current project without deleting folders or overwriting existing files. Use when the user asks to install, set up, or update this toolkit in a project.
+description: Synchronize the Docker Claude toolkit's .claude skills and scripts into the current project. Plugin-managed files are overwritten by the installed plugin version; unrelated project files are preserved. Use when the user asks to install, set up, or update this toolkit in a project.
 argument-hint: "[--target <project-path>] [--dry-run]"
 disable-model-invocation: true
 ---
 
 # Install Docker Claude into a project
 
-Install the bundled project files with the plugin's safe merge installer.
+Install or update the bundled project files with the plugin's synchronization installer.
 
 ## Command
 
@@ -21,7 +21,7 @@ Interpret `$ARGUMENTS` as follows:
 
 - No arguments: install into `${CLAUDE_PROJECT_DIR}`.
 - `--target <project-path>`: use that directory instead.
-- `--dry-run`: preview the merge without writing.
+- `--dry-run`: preview the synchronization without writing.
 - Both flags may be combined.
 - Reject any other argument; do not invent or forward unsupported flags.
 
@@ -32,10 +32,11 @@ The installer only considers these bundled payloads:
 - `.claude/skills/**` → `<target>/.claude/skills/**`
 - operational files in `scripts/**` → `<target>/scripts/**`
 
-It creates missing directories and copies missing files. Existing files are never overwritten:
+It creates missing directories and synchronizes every plugin-managed file:
 
 - Same content: reported as unchanged.
-- Different content at the same path: reported as a conflict and left untouched.
+- Different content at the same path: atomically overwritten with the bundled version.
 - Unrelated existing files: never inspected beyond their destination path and never removed.
+- Destination symlinks and non-regular files: rejected without following or replacing them.
 
-After installation, report the copied, unchanged, and conflicting counts. If any project skills were newly added, tell the user to run `/reload-plugins` or restart Claude Code.
+After installation, report the copied, overwritten, and unchanged counts. Tell the user to run `/reload-plugins` or restart Claude Code so updated project skills are reloaded.

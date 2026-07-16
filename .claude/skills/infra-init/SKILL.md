@@ -1,11 +1,11 @@
 ---
 name: infra-init
-description: Scaffold `infra/` directory (shared Docker compose + Dockerfiles + env template + README) for a multi-service project. Interactive — scans sibling folders for candidate services (Node/Python/Go), reads their tech stack (deps in package.json, requirements.txt, go.mod), and auto-suggests the needed infra modules (postgres, redis, kafka/redpanda, keycloak, temporal, minio, elasticsearch). Use when starting a new multi-service project, or when the user says "khởi tạo infra", "scaffold docker cho dự án", "tạo compose cho project mới", "generate infra folder".
+description: Scaffold `infra/` directory (shared Docker compose + Dockerfiles + env template + README) for a multi-service project. Interactive or fully automatic with `--yes` — scans sibling folders for candidate services (Node/Python/Go), reads their tech stack (deps in package.json, requirements.txt, go.mod), and selects the needed infra modules (postgres, redis, kafka/redpanda, keycloak, temporal, minio, elasticsearch). Use when starting a new multi-service project, or when the user says "khởi tạo infra", "scaffold docker cho dự án", "tạo compose cho project mới", "generate infra folder".
 ---
 
 # infra-init
 
-Interactive scaffold for shared Docker infrastructure across multiple app services in a repo.
+Interactive or non-interactive scaffold for shared Docker infrastructure across multiple app services in a repo.
 
 ## When to invoke
 
@@ -19,12 +19,15 @@ Do **not** trigger for: adding a single service to an existing infra (edit `dock
 ## Command
 
 ```bash
-./scripts/infra-init.py [--root <path>] [--force]
+./scripts/infra-init.py [--root <path>] [--force] [--yes | --detect-json | --config <json>]
 ```
 
 Flags:
 - `--root <path>` — project root to scan (default: parent of `scripts/`)
 - `--force` — overwrite existing `infra/` (backs up to `infra.backup.<timestamp>/`)
+- `--yes` / `-y` — include all supported detected services, use detected/default ports and root-derived project/network names, enable detected infra modules, and write without prompting. Postgres is also enabled when required by Keycloak or Temporal. Fails early when a selected Python/Go service has no Dockerfile instead of generating a broken compose plan.
+- `--detect-json` — read-only preflight. Prints candidates, suggested choices, and uncertainty records without prompting or writing.
+- `--config <json>` — generate without prompts from a reviewed config. Accepts either the full `--detect-json` report or its `suggested_config` object.
 
 ## Workflow
 
@@ -37,7 +40,7 @@ Flags:
    - `@temporalio/*` → temporal
    - `@aws-sdk/client-s3|minio` → minio
    - `@elastic/elasticsearch` → elasticsearch
-3. **Prompt** interactive:
+3. **Plan** interactively, or automatically with `--yes`:
    - Compose project name + docker network name
    - Include/exclude each detected service, set host port + container port
    - Enable/disable each detected infra module (allowing user to override auto-detect)
@@ -55,7 +58,7 @@ Flags:
 ## Behaviour rules
 
 1. **Non-destructive**: refuses to write if `infra/` exists. `--force` backs up first, never deletes silently.
-2. **Interactive-only**: no CI-friendly non-interactive mode yet. If user needs it, add `--config plan.yml`.
+2. **Automation-safe**: `--yes` and `--config` never read stdin. Agents should use `--detect-json`, ask the user only about reported or evidence-based uncertainties, then use `--config`. Bare `--yes` is for CI or explicit acceptance of all detected defaults. Without these flags, every choice remains interactive.
 3. **Node-first**: only generates Dockerfile for Node services. Python/Go services detected but Dockerfile is user's responsibility.
 4. **Env wiring per service**: apps compose only wires env vars for infra modules the service actually needs (based on deps). Avoids polluting service env with unused KAFKA_BROKERS etc.
 

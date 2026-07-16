@@ -7,6 +7,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -61,19 +62,20 @@ class InstallProjectTests(unittest.TestCase):
             self.assertFalse((target / "scripts" / "install-project.py").exists())
             self.assertFalse((target / ".claude" / "settings.local.json").exists())
 
-    def test_conflicting_file_is_kept(self) -> None:
+    def test_plugin_managed_file_is_overwritten(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             target = Path(temp)
-            conflict = target / "scripts" / "infra-up.sh"
-            conflict.parent.mkdir(parents=True)
-            conflict.write_text("project-owned content\n")
+            managed_file = target / "scripts" / "infra-up.sh"
+            managed_file.parent.mkdir(parents=True)
+            managed_file.write_text("outdated project copy\n")
 
             result = self.run_installer(target)
 
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(conflict.read_text(), "project-owned content\n")
-            self.assertIn("conflict", result.stdout)
-            self.assertIn("1 conflicts kept", result.stdout)
+            self.assertEqual(managed_file.read_bytes(), (ROOT / "scripts" / "infra-up.sh").read_bytes())
+            self.assertTrue(managed_file.stat().st_mode & stat.S_IXUSR)
+            self.assertIn("overwritten", result.stdout)
+            self.assertIn("1 overwritten", result.stdout)
 
     def test_legacy_bootstrap_skill_is_preserved_while_new_name_is_added(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -99,7 +101,7 @@ class InstallProjectTests(unittest.TestCase):
             self.assertEqual(first.returncode, 0, first.stderr)
             self.assertEqual(second.returncode, 0, second.stderr)
             self.assertIn("0 copied", second.stdout)
-            self.assertIn("0 conflicts kept", second.stdout)
+            self.assertIn("0 overwritten", second.stdout)
             self.assertNotIn("  copied", second.stdout)
 
     def test_dry_run_writes_nothing(self) -> None:
@@ -113,6 +115,19 @@ class InstallProjectTests(unittest.TestCase):
             self.assertFalse((target / ".claude").exists())
             self.assertFalse((target / "scripts").exists())
 
+    def test_dry_run_does_not_overwrite_managed_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            target = Path(temp)
+            managed_file = target / "scripts" / "infra-up.sh"
+            managed_file.parent.mkdir(parents=True)
+            managed_file.write_text("keep during preview\n")
+
+            result = self.run_installer(target, "--dry-run")
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(managed_file.read_text(), "keep during preview\n")
+            self.assertIn("would overwrite", result.stdout)
+
     def test_file_blocking_destination_directory_is_not_replaced(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             target = Path(temp)
@@ -125,6 +140,19 @@ class InstallProjectTests(unittest.TestCase):
             self.assertEqual(blocker.read_text(), "keep me\n")
             self.assertFalse((target / ".claude").exists())
             self.assertIn("error:", result.stderr)
+
+    def test_directory_at_managed_file_path_is_not_replaced(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            target = Path(temp)
+            managed_path = target / "scripts" / "infra-up.sh"
+            managed_path.mkdir(parents=True)
+
+            result = self.run_installer(target)
+
+            self.assertEqual(result.returncode, 2)
+            self.assertTrue(managed_path.is_dir())
+            self.assertFalse((target / ".claude").exists())
+            self.assertIn("destination is not a regular file", result.stderr)
 
     def test_symlinked_payload_directory_is_rejected_before_copying(self) -> None:
         with tempfile.TemporaryDirectory() as temp, tempfile.TemporaryDirectory() as external_temp:
@@ -161,10 +189,55 @@ class InstallProjectTests(unittest.TestCase):
             (target / ".claude").symlink_to(external, target_is_directory=True)
 
             with self.assertRaises(OSError):
-                INSTALLER_MODULE.copy_missing_files(plan, target)
+                INSTALLER_MODULE.install_files(plan, target)
 
             self.assertEqual(list(external.iterdir()), [])
             self.assertFalse((external / "skills").exists())
+
+    def test_symlinked_managed_file_is_rejected_without_touching_target(self) -> None:
+        with tempfile.TemporaryDirectory() as temp, tempfile.TemporaryDirectory() as external_temp:
+            target = Path(temp)
+            external = Path(external_temp) / "infra-up.sh"
+            external.write_text("external content\n")
+            managed_file = target / "scripts" / "infra-up.sh"
+            managed_file.parent.mkdir(parents=True)
+            managed_file.symlink_to(external)
+
+            result = self.run_installer(target)
+
+            self.assertEqual(result.returncode, 2)
+            self.assertEqual(external.read_text(), "external content\n")
+            self.assertTrue(managed_file.is_symlink())
+            self.assertRegex(
+                result.stderr,
+                r"destination (escapes target directory|file must not be a symlink)",
+            )
+
+    def test_atomic_overwrite_failure_preserves_original_and_cleans_temp_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            target = Path(temp).resolve()
+            managed_file = target / "scripts" / "infra-up.sh"
+            managed_file.parent.mkdir(parents=True)
+            managed_file.write_text("original content\n")
+            source = ROOT / "scripts" / "infra-up.sh"
+            plan = INSTALLER_MODULE.MergePlan(overwrite=[(source, managed_file)])
+
+            def failing_rename(*args, **kwargs):
+                raise OSError("simulated rename failure")
+
+            with mock.patch.object(INSTALLER_MODULE.os, "rename", failing_rename):
+                INSTALLER_MODULE.os.supports_dir_fd.add(failing_rename)
+                try:
+                    with self.assertRaises(OSError):
+                        INSTALLER_MODULE.install_files(plan, target)
+                finally:
+                    INSTALLER_MODULE.os.supports_dir_fd.discard(failing_rename)
+
+            self.assertEqual(managed_file.read_text(), "original content\n")
+            self.assertEqual(
+                list(managed_file.parent.glob(".infra-up.sh.docker-claude.*.tmp")),
+                [],
+            )
 
 
 if __name__ == "__main__":

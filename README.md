@@ -1,20 +1,21 @@
 # Docker Claude Toolkit
 
-Marketplace/plugin cho Claude Code, dùng để bổ sung bộ Docker infrastructure skills và scripts vào nhiều project mà không thay thế thư mục `.claude` hoặc `scripts` đã có.
+Marketplace/plugin cho Claude Code, dùng để đồng bộ bộ Docker infrastructure skills và scripts vào nhiều project mà không thay thế toàn bộ thư mục `.claude` hoặc `scripts` đã có.
 
 ## Cơ chế cài đặt
 
 Claude Code luôn cài marketplace plugin vào cache riêng, không có lifecycle hook chạy đúng tại thời điểm `/plugin install` để tự chép file vào project. Vì vậy quy trình an toàn gồm hai lệnh:
 
 1. Cài plugin từ marketplace.
-2. Chạy skill `/docker-claude:install-project` để merge payload vào project hiện tại.
+2. Chạy skill `/docker-claude:install-project` để đồng bộ payload vào project hiện tại.
 
 Installer xử lý từng file:
 
 - Tạo `.claude/skills` và `scripts` nếu chưa có.
-- Chỉ copy file chưa tồn tại.
-- File đã có và giống nhau được giữ nguyên, báo `unchanged`.
-- File đã có nhưng khác nội dung được giữ nguyên, báo `conflict`.
+- Copy file plugin chưa tồn tại.
+- File plugin đã có và giống nhau được giữ nguyên, báo `unchanged`.
+- File plugin đã có nhưng khác nội dung được ghi đè nguyên tử, báo `overwritten`.
+- File khác không thuộc payload plugin được giữ nguyên.
 - Không xóa hoặc thay thế nguyên folder.
 - Không publish/copy `.claude/settings.local.json`.
 
@@ -49,7 +50,21 @@ Hoặc thêm marketplace, mở `/plugin`, vào tab **Discover**, chọn `docker-
 /reload-plugins
 ```
 
-Với `user` scope, plugin có thể được gọi bởi user hiện tại trong nhiều project. Dù chọn scope nào, payload `.claude/skills` và `scripts` chỉ được merge vào project khi bạn chủ động chạy `install-project` tại project đó.
+Với `user` scope, plugin có thể được gọi bởi user hiện tại trong nhiều project. Dù chọn scope nào, payload `.claude/skills` và `scripts` chỉ được đồng bộ vào project khi bạn chủ động chạy `install-project` tại project đó.
+
+## Update project đã cài plugin
+
+Sau khi producer publish version mới, chạy trong từng project consumer:
+
+```text
+/plugin marketplace update driverplus-tools
+/plugin update docker-claude@driverplus-tools
+/reload-plugins
+/docker-claude:install-project
+/reload-plugins
+```
+
+Lần `/reload-plugins` đầu kích hoạt version plugin mới trước khi chạy installer; lần thứ hai nạp lại các project skill vừa được đồng bộ. `install-project` ghi đè toàn bộ file do plugin quản lý bằng version vừa update. Các file khác trong `.claude/skills/` và `scripts/` không thuộc payload plugin vẫn được giữ nguyên.
 
 ## Hướng dẫn chạy
 
@@ -66,10 +81,14 @@ Cách nhanh nhất trong Claude Code:
 Hoặc chạy trực tiếp trong terminal:
 
 ```bash
-./scripts/bootstrap.sh
+./scripts/bootstrap.sh --yes
 ```
 
 `docker-bootstrap` sẽ lần lượt khởi tạo `infra/` nếu chưa có, kiểm tra `infra/.env`, bật infrastructure và application services, verify environment rồi in các URL localhost. Lệnh không tự xóa container, image hoặc volume.
+
+Ở chế độ `--yes`, các giá trị `REPLACE_ME_*` trong `.env.example` được thay bằng secret local ngẫu nhiên trước khi Docker khởi động; giá trị secret không được in ra output. Nếu project có Python/Go service chưa có Dockerfile, preflight sẽ yêu cầu quyết định thêm Dockerfile hoặc loại service khỏi plan thay vì tạo compose không build được.
+
+Khi gọi qua Claude Code, skill sẽ tự scan project trước. Các lựa chọn chắc chắn từ source được áp dụng tự động; các điểm mơ hồ như thiếu/trùng port, Dockerfile còn thiếu hoặc dependency chỉ gợi ý module sẽ được gom lại hỏi một lượt theo kiểu Grill Me. Sau khi nhận câu trả lời, agent tự chạy tiếp đến cuối — user không phải copy lệnh sang terminal.
 
 Một số biến thể thường dùng:
 
@@ -78,7 +97,8 @@ Một số biến thể thường dùng:
 ./scripts/bootstrap.sh --recreate              # tạo lại container để nhận config/env mới
 ./scripts/bootstrap.sh --build --recreate      # build và tạo lại container
 ./scripts/bootstrap.sh --skip-verify           # bỏ qua bước verify environment
-./scripts/bootstrap.sh --yes                   # tự chấp nhận prompt init/copy env
+./scripts/bootstrap.sh --yes                   # tự chạy toàn bộ, kể cả infra-init lồng bên trong
+./scripts/bootstrap.sh --init-config plan.json # chạy với lựa chọn infra-init đã review
 ```
 
 Nếu `infra/.env` chưa tồn tại, có thể tạo từ template rồi điền secret thật trước khi bật toàn bộ stack:
@@ -94,6 +114,8 @@ cp infra/.env.example infra/.env
 | Mục đích | Trong Claude Code | Chạy trực tiếp trong terminal |
 | --- | --- | --- |
 | Khởi tạo thư mục `infra/` | `/infra-init` | `./scripts/infra-init.py` |
+| Khởi tạo `infra/` tự động theo kết quả detect | `/infra-init --yes` | `./scripts/infra-init.py --yes` |
+| Xem plan/điểm chưa chắc chắn dạng JSON | — | `./scripts/infra-init.py --detect-json` |
 | Bật toàn bộ infra và app | `/infra-up` | `./scripts/infra-up.sh` |
 | Bật lại và build image | `/infra-up --build` | `./scripts/infra-up.sh --build` |
 | Chỉ bật shared infrastructure | `/infra-up --infra-only` | `./scripts/infra-up.sh --infra-only` |
@@ -116,7 +138,7 @@ Xem toàn bộ tùy chọn của một script bằng `--help`, ví dụ:
 ./scripts/sync-env-docker.py verify --help
 ```
 
-## Preview trước khi merge
+## Preview trước khi đồng bộ
 
 ```text
 /docker-claude:install-project --dry-run
@@ -165,9 +187,9 @@ claude --plugin-dir .
 /docker-claude:install-project
 ```
 
-Việc chạy lại installer chỉ thêm file mới. File project đã tồn tại không bị update âm thầm; conflict sẽ được liệt kê để xử lý thủ công.
+Việc chạy lại installer sẽ cập nhật mọi file thuộc payload plugin lên version mới nhất, đồng thời giữ nguyên các file khác không do plugin quản lý.
 
-Từ phiên bản `1.0.1`, skill `bootstrap` được đổi tên thành `docker-bootstrap`. Với project đã cài bản cũ, chạy lại `/docker-claude:install-project` để thêm skill mới. Installer giữ nguyên `.claude/skills/bootstrap` cũ theo nguyên tắc không tự xóa file project; có thể xóa skill cũ thủ công sau khi xác nhận project đã nhận `.claude/skills/docker-bootstrap`.
+Từ phiên bản `1.0.1`, skill `bootstrap` được đổi tên thành `docker-bootstrap`. Với project đã cài bản cũ, chạy lại `/docker-claude:install-project` để thêm skill mới. Installer không xóa file không còn trong payload, nên `.claude/skills/bootstrap` cũ vẫn được giữ lại; có thể xóa skill cũ thủ công sau khi xác nhận project đã nhận `.claude/skills/docker-bootstrap`.
 
 ## Cấu trúc
 
@@ -175,8 +197,8 @@ Từ phiên bản `1.0.1`, skill `bootstrap` được đổi tên thành `docker
 .claude-plugin/
   marketplace.json       # catalog của driverplus-tools
   plugin.json            # manifest của docker-claude
-.claude/skills/           # payload skills được merge vào project
+.claude/skills/           # payload skills được đồng bộ vào project
 skills/install-project/   # skill namespaced dùng để chạy installer
 scripts/                  # payload scripts + installer (installer không được copy)
-tests/                    # test đảm bảo merge không phá file hiện có
+tests/                    # test đảm bảo đồng bộ không đụng file ngoài payload
 ```
